@@ -1,0 +1,81 @@
+# W3C Baggage and the composite propagator (OTEL_PROPAGATORS).
+#
+# expect: parsed [region tenant userId] alice acme eu west
+# expect: metadata region=prop1;prop2
+# expect: malformed skipped 3
+# expect: header region=eu%20west;prop1;prop2,tenant=acme,userId=alice
+# expect: roundtrip true
+# expect: invalid key ignored false size 3
+# expect: remove [region userId] empty false
+# expect: copy independent 2 3
+# expect: injected baggage true
+# expect: empty baggage writes nothing 0
+# expect: special values a%2Cb%3Bc%3D%25 -> a,b;c=%
+# expect: member limit 180
+# expect: byte limit under 8192 true
+# expect: propagator fields [traceparent tracestate baggage]
+# expect: only baggage [baggage] trace-invalid true baggage alice
+# expect: none [] nothing-written 0
+# expect: inject both 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 userId=alice
+# expect: Otel.extract true Otel.extractBaggage alice
+
+from @lam/otel import OtelBaggage, OtelPropagator, OtelSpanContext, Otel
+
+func main() {
+    b: OtelBaggage = OtelBaggage.fromHeader("userId=alice, tenant = acme ,region=eu%20west;prop1;prop2")
+    print("parsed", b.keys(), b.get("userId"), b.get("tenant"), b.get("region"))
+    print("metadata", "region=" + b.getMetadata("region"))
+    bad: OtelBaggage = OtelBaggage.fromHeader("good=1,=nokey,novalue,bad key=2,also=2,ok=3")
+    print("malformed skipped", bad.size())
+    print("header", b.toHeader())
+    again: OtelBaggage = OtelBaggage.fromHeader(b.toHeader())
+    print("roundtrip", again.toHeader() == b.toHeader() and again.get("region") == "eu west")
+    b.set("bad key", "x")
+    print("invalid key ignored", b.has("bad key"), "size", b.size())
+    c: OtelBaggage = b.copy()
+    b.remove("tenant")
+    print("remove", b.keys(), "empty", b.isEmpty())
+    print("copy independent", b.size(), c.size())
+
+    headers: dict[str, str] = {}
+    b.inject(headers)
+    print("injected baggage", headers["baggage"].contains("userId=alice"))
+    none: dict[str, str] = {}
+    OtelBaggage().inject(none)
+    print("empty baggage writes nothing", len(none))
+
+    special: OtelBaggage = OtelBaggage()
+    special.set("k", "a,b;c=%")
+    encoded: str = special.toHeader()
+    print("special values", encoded[2:], "->", OtelBaggage.fromHeader(encoded).get("k"))
+
+    many: OtelBaggage = OtelBaggage()
+    for i in range(200) {
+        many.set("k" + str(i), "v")
+    }
+    print("member limit", many.size())
+    big: OtelBaggage = OtelBaggage()
+    for i in range(100) {
+        big.set("key" + str(i), "x" * 200)
+    }
+    print("byte limit under 8192", len(big.toHeader()) <= 8192)
+
+    p: OtelPropagator = OtelPropagator.parse("tracecontext, baggage, b3")
+    print("propagator fields", p.fields())
+    only: OtelPropagator = OtelPropagator.parse("baggage")
+    incoming: dict[str, str] = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "Baggage": "userId=alice"}
+    print("only baggage", only.fields(), "trace-invalid", not only.extract(incoming).isValid(), "baggage", only.extractBaggage(incoming).get("userId"))
+    off: OtelPropagator = OtelPropagator.parse("none")
+    written: dict[str, str] = {}
+    ab: OtelBaggage = OtelBaggage()
+    ab.set("a", "b")
+    off.inject(written, OtelSpanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 1), ab)
+    print("none", off.fields(), "nothing-written", len(written))
+
+    out: dict[str, str] = {}
+    user: OtelBaggage = OtelBaggage()
+    user.set("userId", "alice")
+    p.inject(out, OtelSpanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 1), user)
+    print("inject both", out["traceparent"], out["baggage"])
+    print("Otel.extract", Otel.extract(incoming).isValid(), "Otel.extractBaggage", Otel.extractBaggage(incoming).get("userId"))
+}

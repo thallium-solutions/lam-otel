@@ -1,0 +1,72 @@
+# Logs: severities, minimum severity, trace correlation, attribute limits,
+# structured bodies, event names, batch processor and logger provider
+# lifecycle.
+#
+# expect: severity text TRACE DEBUG INFO WARN ERROR FATAL INFO3 -
+# expect: severity parse 9 13 13 21 0
+# expect: emitted 4 bodies [started payment declined fatal-but-alive structured]
+# expect: filtered debug true enabled false true
+# expect: levels 9 13 17 21
+# expect: correlated true true flags 1
+# expect: uncorrelated no ids true
+# expect: attributes kept 2 dropped 1 truncated abcd
+# expect: structured body kvlistValue true
+# expect: event name payment.declined explicit time 12345
+# expect: scope payments 1.2 resource billing
+# expect: batch queued 3 exported after flush 3
+# expect: shutdown flushes 4 refused after shutdown 4
+# expect: logger cached true noop records nothing true
+
+from @lam/otel import OtelLoggerProvider, OtelLogger, OtelLogRecord, OtelSeverity, OtelInMemoryLogExporter, OtelSimpleLogProcessor, OtelBatchLogProcessor, OtelResource, OtelSpan, OtelSpanContext
+from lamjson import Json
+
+func main() {
+    print("severity text", OtelSeverity.text(1), OtelSeverity.text(5), OtelSeverity.text(9), OtelSeverity.text(13), OtelSeverity.text(17), OtelSeverity.text(21), OtelSeverity.text(11), "-" + OtelSeverity.text(0))
+    print("severity parse", OtelSeverity.parse("info"), OtelSeverity.parse("WARNING"), OtelSeverity.parse("warn"), OtelSeverity.parse("critical"), OtelSeverity.parse("loud"))
+
+    mem: OtelInMemoryLogExporter = OtelInMemoryLogExporter()
+    provider: OtelLoggerProvider = OtelLoggerProvider(OtelResource({"service.name": "billing"}), 2, 4)
+    provider.addProcessor(OtelSimpleLogProcessor(mem))
+    provider.setMinSeverity(OtelSeverity.INFO)
+    logger: OtelLogger = provider.logger("payments", "1.2")
+
+    span: OtelSpan = OtelSpan("charge")
+    logger.debug("hidden")
+    logger.info("started", {"order": "o-1"}, span.spanContext())
+    logger.warn("payment declined", {"a": "abcdefgh", "b": 1, "c": 2}, span.spanContext())
+    logger.fatal("fatal-but-alive")
+    logger.emit(OtelSeverity.ERROR, {"code": 402, "reason": "card"}, {}, None, 12345, "payment.declined")
+    bodies: list[str] = mem.bodies()
+    print("emitted", mem.count(), "bodies", "[" + bodies[0] + " " + bodies[1] + " " + bodies[2] + " " + "structured]")
+    print("filtered debug", mem.count() == 4, "enabled", logger.enabled(OtelSeverity.DEBUG), logger.enabled(OtelSeverity.ERROR))
+    recs: list[OtelLogRecord] = mem.finishedRecords()
+    structured: OtelLogRecord = recs[3]
+    print("levels", recs[0].severityNumber, recs[1].severityNumber, recs[3].severityNumber, recs[2].severityNumber)
+    print("correlated", recs[0].traceId == span.traceId, recs[0].spanId == span.spanId, "flags", recs[0].traceFlags)
+    print("uncorrelated no ids", recs[2].traceId == "")
+    warnAttrs: dict[str, any] = recs[1].attributes
+    print("attributes kept", len(warnAttrs), "dropped", recs[1].droppedAttributesCount, "truncated", warnAttrs["a"])
+    doc: json = structured.toJson()
+    print("structured body kvlistValue", Json.kind(doc.body.kvlistValue) == "object")
+    print("event name", structured.eventName, "explicit time", structured.timeUnixNano)
+    print("scope", recs[0].scopeName, recs[0].scopeVersion, "resource", recs[0].resource.serviceName())
+
+    batchMem: OtelInMemoryLogExporter = OtelInMemoryLogExporter()
+    batch: OtelBatchLogProcessor = OtelBatchLogProcessor(batchMem, 100, 60000, 50, 5000)
+    bp: OtelLoggerProvider = OtelLoggerProvider()
+    bp.addProcessor(batch)
+    bl: OtelLogger = bp.logger("batch")
+    bl.info("one")
+    bl.info("two")
+    bl.info("three")
+    queued: int = batch.queued()
+    batch.forceFlush()
+    print("batch queued", queued, "exported after flush", batchMem.count())
+    bl.info("four")
+    bp.shutdown()
+    bl.info("five")
+    print("shutdown flushes", batchMem.count(), "refused after shutdown", batchMem.count())
+
+    noop: OtelLoggerProvider = OtelLoggerProvider.noop()
+    print("logger cached", provider.logger("payments", "1.2") == logger, "noop records nothing", not noop.logger("x").enabled(OtelSeverity.FATAL))
+}

@@ -1,0 +1,136 @@
+# The span model: attributes and limits, events, links, status rules,
+# exceptions, renaming, end semantics and durations.
+#
+# expect: kind 2 scope model 0.1 resource orders
+# expect: attrs str int float bool list
+# expect: none and empty key ignored true true
+# expect: count limit kept 3 dropped 2 overwrite ok v2
+# expect: length limit abcde [abcde xy] 1234567
+# expect: events 2 dropped 1
+# expect: event attrs kept 2 dropped 1
+# expect: links 1 dropped 1 invalid ignored true
+# expect: link attrs kept 1 dropped 1
+# expect: status unset ignored 0
+# expect: status error 2 timeout
+# expect: status ok final 1 empty-description true
+# expect: exception event exception message=boom type=IOError stack=trace
+# expect: recordError type=DbError message=lost (caused by: socket closed)
+# expect: fail status 2 events 2
+# expect: renamed GET /orders/{id}
+# expect: end idempotent true end>=start true
+# expect: after end ignored true true
+# expect: explicit times 1000 5000 duration 4000
+# expect: durationMs non-negative true
+# expect: standalone span recording true sampled true ids 32 16
+# expect: setParent 00f067aa0ba902b7
+# expect: toJson name GET /orders/{id} droppedAttributesCount 1
+
+from @lam/otel import OtelTracerProvider, OtelTracer, OtelSpan, OtelSpanKind, OtelStatusCode, OtelSpanLimits, OtelSpanContext, OtelSpanLink, OtelResource, OtelSampler
+from lamerrors import Error
+
+func main() {
+    limits: OtelSpanLimits = OtelSpanLimits(5, 5, 2, 1, 2, 1)
+    resource: OtelResource = OtelResource({"service.name": "orders"})
+    provider: OtelTracerProvider = OtelTracerProvider(resource, OtelSampler.alwaysOn(), limits)
+    tracer: OtelTracer = provider.tracer("model", "0.1")
+    span: OtelSpan = tracer.startSpan("GET /orders", OtelSpanKind.SERVER, None, {"a": "1", "b": 2})
+    print("kind", span.kind, "scope", span.scopeName, span.scopeVersion, "resource", span.resource.serviceName())
+
+    span.setAttribute("c", 1.5)
+    span.setAttribute("d", true)
+    span.setAttribute("e", ["x", "y"])
+    names: list[str] = []
+    for k in ["a", "b", "c", "d", "e"] {
+        v: any = span.getAttribute(k)
+        if isinstance(v, str) {
+            names.append("str")
+        } elif isinstance(v, bool) {
+            names.append("bool")
+        } elif isinstance(v, int) {
+            names.append("int")
+        } elif isinstance(v, float) {
+            names.append("float")
+        } else {
+            names.append("list")
+        }
+    }
+    print("attrs", names[0], names[1], names[2], names[3], names[4])
+    span.setAttribute("n", None)
+    span.setAttribute("", "x")
+    print("none and empty key ignored", span.getAttribute("n") == None, span.droppedAttributesCount == 0)
+
+    small: OtelSpan = tracer.startSpan("small", attributes={"k1": "v", "k2": "v", "k3": "v"})
+    small.limits = OtelSpanLimits(3)
+    small.setAttributes({"k4": "v", "k5": "v", "k1": "v2"})
+    print("count limit kept", len(small.attributes), "dropped", small.droppedAttributesCount, "overwrite ok", small.getAttribute("k1"))
+
+    span2: OtelSpan = tracer.startSpan("len")
+    span2.setAttribute("s", "abcdefgh")
+    span2.setAttribute("l", ["abcdefg", "xy"])
+    span2.setAttribute("i", 1234567)
+    print("length limit", span2.getAttribute("s"), span2.getAttribute("l"), span2.getAttribute("i"))
+
+    span.addEvent("one")
+    span.addEvent("two", {"x": 1, "y": 2, "z": 3})
+    span.addEvent("three")
+    print("events", len(span.events), "dropped", span.droppedEventsCount)
+    print("event attrs kept", len(span.events[1].attributes), "dropped", span.events[1].droppedAttributesCount)
+
+    ctx: OtelSpanContext = OtelSpanContext("abababababababababababababababab", "cdcdcdcdcdcdcdcd", 1)
+    span.addLink(OtelSpanContext.invalid())
+    span.addLink(ctx, {"p": 1, "q": 2})
+    span.addLink(ctx)
+    print("links", len(span.links), "dropped", span.droppedLinksCount, "invalid ignored", true)
+    print("link attrs kept", len(span.links[0].attributes), "dropped", span.links[0].droppedAttributesCount)
+
+    st: OtelSpan = tracer.startSpan("status")
+    st.setStatus(OtelStatusCode.UNSET, "ignored")
+    print("status unset ignored", st.statusCode)
+    st.setStatus(OtelStatusCode.ERROR, "timeout")
+    print("status error", st.statusCode, st.statusMessage)
+    st.setStatus(OtelStatusCode.OK, "description dropped")
+    st.setStatus(OtelStatusCode.ERROR, "too late")
+    print("status ok final", st.statusCode, "empty-description", st.statusMessage == "")
+
+    # Exceptions with the default limits (the provider above truncates to 5).
+    plain: OtelTracer = OtelTracerProvider().tracer("plain")
+    ex: OtelSpan = plain.startSpan("exceptions")
+    ex.recordException("boom", "IOError", "trace")
+    a: dict[str, any] = ex.events[0].attributes
+    print("exception event", ex.events[0].name, "message=" + str(a["exception.message"]), "type=" + str(a["exception.type"]), "stack=" + str(a["exception.stacktrace"]))
+    ex2: OtelSpan = plain.startSpan("errors")
+    ex2.recordError(Error("DbError", "lost", "socket closed"))
+    b: dict[str, any] = ex2.events[0].attributes
+    print("recordError", "type=" + str(b["exception.type"]), "message=" + str(b["exception.message"]))
+    ex2.fail("giving up")
+    print("fail status", ex2.statusCode, "events", len(ex2.events))
+
+    span.updateName("GET /orders/{id}")
+    span.setAttribute("f", 1)
+    print("renamed", span.name)
+
+    span.end()
+    first: int = span.endTimeUnixNano
+    span.end()
+    print("end idempotent", span.endTimeUnixNano == first, "end>=start", span.endTimeUnixNano >= span.startTimeUnixNano)
+    span.setAttribute("late", 1)
+    span.addEvent("late")
+    span.updateName("late")
+    print("after end ignored", span.getAttribute("late") == None, span.name == "GET /orders/{id}")
+
+    timed: OtelSpan = tracer.startSpan("timed", startTimeUnixNano=1000)
+    timed.end(5000)
+    print("explicit times", timed.startTimeUnixNano, timed.endTimeUnixNano, "duration", timed.durationNanos())
+    openSpan: OtelSpan = tracer.startSpan("open")
+    print("durationMs non-negative", openSpan.durationMs() >= 0)
+
+    standalone: OtelSpan = OtelSpan("standalone")
+    print("standalone span recording", standalone.isRecording(), "sampled", standalone.isSampled(), "ids", len(standalone.traceId), len(standalone.spanId))
+    standalone.setParent("00f067aa0ba902b7")
+    print("setParent", standalone.parentSpanId)
+
+    doc: json = span.toJson()
+    jname: str = doc.name
+    jdropped: int = doc.droppedAttributesCount
+    print("toJson name", jname, "droppedAttributesCount", jdropped)
+}

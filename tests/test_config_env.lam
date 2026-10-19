@@ -1,0 +1,121 @@
+# OtelConfig.fromEnv: the standard OTEL_* variables, defaults, per-signal
+# overrides, resource attributes and header parsing.
+#
+# expect: defaults unknown_service http://localhost:4318/v1/traces 10000 parentbased_always_on
+# expect: default exporters otlp otlp otlp tracecontext,baggage
+# expect: default bsp 5000 2048 512 30000 metric 60000
+# expect: service from resource attrs billing
+# expect: service billing-api wins true
+# expect: version 2.0.0 env prod
+# expect: resource region=eu-west-1 team=core,ops
+# expect: traces https://collector.example/custom/traces
+# expect: metrics https://otel.example:4318/v1/metrics
+# expect: logs https://otel.example:4318/v1/logs
+# expect: headers api-key=s3cr3t x-tenant=t1 logs-only=
+# expect: logs headers merge s3cr3t t1 yes
+# expect: timeouts 7000 2500 7000
+# expect: compression gzip none gzip
+# expect: exporters console none otlp
+# expect: sampler traceidratio 0.25
+# expect: bsp 250 100 10 900
+# expect: blrp 300 50 5 800
+# expect: metric interval 1500 timeout 700
+# expect: limits 64 32 10 5 3 2
+# expect: log limits -2 -2
+# expect: disabled true
+# expect: blank variables keep defaults 10000 otlp
+# expect: retry 5 1000 5000
+# expect: isReady true false
+# expect: pairs a=1 b=x y c=d=e count 3
+# expect: parseHeaders Authorization=Basic abc=
+
+from @lam/otel import OtelConfig, OtelResource, Otel
+from lamenv import Env
+
+func show(m: dict[str, str], key: str) -> str {
+    if key in m {
+        return key + "=" + m[key]
+    }
+    return key + "="
+}
+
+func main() {
+    base: OtelConfig = OtelConfig.fromEnv()
+    print("defaults", base.serviceName, base.tracesUrl(), base.timeoutMs, base.sampler)
+    print("default exporters", base.tracesExporter, base.metricsExporter, base.logsExporter, base.propagators)
+    print("default bsp", base.bspScheduleDelayMs, base.bspMaxQueueSize, base.bspMaxExportBatchSize, base.bspExportTimeoutMs, "metric", base.metricExportIntervalMs)
+
+    Env.set("OTEL_RESOURCE_ATTRIBUTES", "service.name=billing, region=eu-west-1,team=core%2Cops")
+    fromAttrs: OtelConfig = OtelConfig.fromEnv()
+    print("service from resource attrs", fromAttrs.serviceName)
+
+    Env.set("OTEL_SERVICE_NAME", "billing-api")
+    Env.set("OTEL_SERVICE_VERSION", "2.0.0")
+    Env.set("OTEL_DEPLOYMENT_ENVIRONMENT", "prod")
+    Env.set("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel.example:4318/")
+    Env.set("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/custom/traces")
+    Env.set("OTEL_EXPORTER_OTLP_HEADERS", "api-key=s3cr3t,x-tenant=t1")
+    Env.set("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "logs-only=yes")
+    Env.set("OTEL_EXPORTER_OTLP_TIMEOUT", "7000")
+    Env.set("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT", "2500")
+    Env.set("OTEL_EXPORTER_OTLP_COMPRESSION", "GZIP")
+    Env.set("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "none")
+    Env.set("OTEL_TRACES_EXPORTER", "console")
+    Env.set("OTEL_METRICS_EXPORTER", "none")
+    Env.set("OTEL_TRACES_SAMPLER", "traceidratio")
+    Env.set("OTEL_TRACES_SAMPLER_ARG", "0.25")
+    Env.set("OTEL_BSP_SCHEDULE_DELAY", "250")
+    Env.set("OTEL_BSP_MAX_QUEUE_SIZE", "100")
+    Env.set("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "10")
+    Env.set("OTEL_BSP_EXPORT_TIMEOUT", "900")
+    Env.set("OTEL_BLRP_SCHEDULE_DELAY", "300")
+    Env.set("OTEL_BLRP_MAX_QUEUE_SIZE", "50")
+    Env.set("OTEL_BLRP_MAX_EXPORT_BATCH_SIZE", "5")
+    Env.set("OTEL_BLRP_EXPORT_TIMEOUT", "800")
+    Env.set("OTEL_METRIC_EXPORT_INTERVAL", "1500")
+    Env.set("OTEL_METRIC_EXPORT_TIMEOUT", "700")
+    Env.set("OTEL_ATTRIBUTE_COUNT_LIMIT", "64")
+    Env.set("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "32")
+    Env.set("OTEL_SPAN_EVENT_COUNT_LIMIT", "10")
+    Env.set("OTEL_SPAN_LINK_COUNT_LIMIT", "5")
+    Env.set("OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT", "3")
+    Env.set("OTEL_LINK_ATTRIBUTE_COUNT_LIMIT", "2")
+    Env.set("OTEL_SDK_DISABLED", "TRUE")
+
+    cfg: OtelConfig = OtelConfig.fromEnv()
+    res: OtelResource = cfg.resource()
+    print("service", cfg.serviceName, "wins", res.serviceName() == "billing-api")
+    print("version", res.getString("service.version"), "env", res.getString("deployment.environment"))
+    print("resource", "region=" + res.getString("region"), "team=" + res.getString("team"))
+    print("traces", cfg.tracesUrl())
+    print("metrics", cfg.metricsUrl())
+    print("logs", cfg.logsUrl())
+    traceHeaders: dict[str, str] = cfg.headersFor("traces")
+    print("headers", show(traceHeaders, "api-key"), show(traceHeaders, "x-tenant"), show(traceHeaders, "logs-only"))
+    logHeaders: dict[str, str] = cfg.headersFor("logs")
+    print("logs headers merge", logHeaders["api-key"], logHeaders["x-tenant"], logHeaders["logs-only"])
+    print("timeouts", cfg.timeoutFor("traces"), cfg.timeoutFor("metrics"), cfg.timeoutFor("logs"))
+    print("compression", cfg.compressionFor("traces"), cfg.compressionFor("metrics"), cfg.compressionFor("logs"))
+    print("exporters", cfg.exporterFor("traces"), cfg.exporterFor("metrics"), cfg.exporterFor("logs"))
+    print("sampler", cfg.sampler, cfg.samplerArg)
+    print("bsp", cfg.bspScheduleDelayMs, cfg.bspMaxQueueSize, cfg.bspMaxExportBatchSize, cfg.bspExportTimeoutMs)
+    print("blrp", cfg.blrpScheduleDelayMs, cfg.blrpMaxQueueSize, cfg.blrpMaxExportBatchSize, cfg.blrpExportTimeoutMs)
+    print("metric interval", cfg.metricExportIntervalMs, "timeout", cfg.metricExportTimeoutMs)
+    print("limits", cfg.attributeCountLimit, cfg.attributeValueLengthLimit, cfg.spanEventCountLimit, cfg.spanLinkCountLimit, cfg.eventAttributeCountLimit, cfg.linkAttributeCountLimit)
+    print("log limits", cfg.logRecordAttributeCountLimit, cfg.logRecordAttributeValueLengthLimit)
+    print("disabled", cfg.disabled)
+
+    Env.set("OTEL_EXPORTER_OTLP_TIMEOUT", "   ")
+    Env.set("OTEL_LOGS_EXPORTER", "")
+    blank: OtelConfig = OtelConfig.fromEnv()
+    print("blank variables keep defaults", blank.timeoutMs, blank.logsExporter)
+    print("retry", blank.retryMaxAttempts, blank.retryInitialBackoffMs, blank.retryMaxBackoffMs)
+
+    empty: OtelConfig = OtelConfig("svc", "")
+    print("isReady", cfg.isReady(), empty.isReady())
+
+    pairs: dict[str, str] = Otel.parsePairs("a=1, b = x%20y ,c=d=e,bad,=skip")
+    print("pairs", show(pairs, "a"), show(pairs, "b"), show(pairs, "c"), "count", len(pairs))
+    hdrs: dict[str, str] = Otel.parseHeaders("Authorization=Basic%20abc%3D")
+    print("parseHeaders", show(hdrs, "Authorization"))
+}

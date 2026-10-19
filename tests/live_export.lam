@@ -1,0 +1,43 @@
+# Live export to a real OTLP/HTTP collector (for example the OpenTelemetry
+# Collector or Jaeger listening on :4318). Runs only with
+# ``python3 tests/run_lamotel_tests.py --live`` and LAMOTEL_LIVE_TESTS=1;
+# the endpoint, headers and service name come from the standard OTEL_*
+# variables (OTEL_EXPORTER_OTLP_ENDPOINT defaults to http://localhost:4318).
+#
+# expect: traces ok true
+# expect: metrics ok true
+# expect: logs ok true
+# expect: shutdown ok true
+
+from @lam/otel import Otel, OtelConfig, OtelSdk, OtelTracer, OtelSpan, OtelSpanKind, OtelStatusCode, OtelLogger
+from lamenv import Env
+from lamerrors import Result
+
+func main() {
+    if Env.getOr("LAMOTEL_LIVE_TESTS", "") != "1" {
+        print("skip: set LAMOTEL_LIVE_TESTS=1 to run live OTLP tests")
+        return
+    }
+    cfg: OtelConfig = OtelConfig.fromEnv()
+    if cfg.serviceName == "unknown_service" {
+        cfg.serviceName = "lam-otel-live-test"
+    }
+    cfg.retryMaxAttempts = 2
+    sdk: OtelSdk = Otel.setup(cfg)
+
+    tracer: OtelTracer = Otel.tracer("lam-otel.live", "1.0.0")
+    root: OtelSpan = tracer.startSpan("live-export", OtelSpanKind.SERVER, None, {"test": "live"})
+    child: OtelSpan = tracer.childSpan(root, "live-child", OtelSpanKind.CLIENT)
+    child.addEvent("checkpoint", {"step": 1})
+    child.end()
+    root.setStatus(OtelStatusCode.OK)
+    root.end()
+    Otel.meter("lam-otel.live").counter("lam_otel.live.runs").add(1, {"result": "ok"})
+    logger: OtelLogger = Otel.logger("lam-otel.live")
+    logger.info("live export test", {"test": "live"}, root.spanContext())
+
+    print("traces ok", sdk.tracerProvider.forceFlush().ok())
+    print("metrics ok", sdk.meterProvider.forceFlush().ok())
+    print("logs ok", sdk.loggerProvider.forceFlush().ok())
+    print("shutdown ok", Otel.shutdown().ok())
+}

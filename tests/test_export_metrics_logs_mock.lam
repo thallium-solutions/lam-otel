@@ -1,0 +1,125 @@
+# OTLP/HTTP JSON export of metrics and logs against an ephemeral local
+# collector: paths, signal headers, ExportMetricsServiceRequest and
+# ExportLogsServiceRequest shapes, periodic metric export and shutdown.
+#
+# expect: metrics POST /v1/metrics metrics-header m1
+# expect: metrics resource inventory scope warehouse 0.9
+# expect: sum stock.moves true 2 asInt 5
+# expect: gauge stock.level asDouble 12.5
+# expect: histogram pick.duration count 3 sum 30 buckets 3 bounds 2 min 5 max 15
+# expect: periodic exports true
+# expect: logs POST /v1/logs logs-header l1
+# expect: log record severity 13 WARN body low stock
+# expect: log trace correlation true true
+# expect: log attributes sku stringValue A-1
+# expect: logs scope warehouse.logs
+# expect: shutdown final export true
+
+from @lam/otel import OtelConfig, OtelMeterProvider, OtelMeter, OtelCounter, OtelGauge, OtelHistogram, OtelMetricReader, OtelOtlpMetricExporter, OtelLoggerProvider, OtelLogger, OtelBatchLogProcessor, OtelOtlpLogExporter, OtelSpan
+from otelmock import OtelMockCollector
+from lamjson import Json
+
+func findMetric(doc: json, name: str) -> json {
+    metrics: json = doc.resourceMetrics[0].scopeMetrics[0].metrics
+    i: int = 0
+    while i < len(metrics) {
+        n: str = metrics[i].name
+        if n == name {
+            return metrics[i]
+        }
+        i += 1
+    }
+    return None
+}
+
+func main() {
+    mock: OtelMockCollector = OtelMockCollector()
+    cfg: OtelConfig = OtelConfig("inventory", mock.url, "", 3000)
+    cfg.metricsHeaders = "x-metrics=m1"
+    cfg.logsHeaders = "x-logs=l1"
+
+    meters: OtelMeterProvider = OtelMeterProvider(cfg.resource())
+    reader: OtelMetricReader = OtelMetricReader(OtelOtlpMetricExporter(cfg), 0)
+    meters.addReader(reader)
+    meter: OtelMeter = meters.meter("warehouse", "0.9")
+    moves: OtelCounter = meter.counter("stock.moves", "{move}")
+    moves.add(2, {"dir": "in"})
+    moves.add(3, {"dir": "in"})
+    level: OtelGauge = meter.gauge("stock.level")
+    level.recordFloat(12.5)
+    picks: OtelHistogram = meter.histogram("pick.duration", "s", "", [10.0, 20.0])
+    picks.record(5)
+    picks.record(10)
+    picks.record(15)
+    reader.forceFlush()
+
+    idx: int = mock.lastIndexFor("/v1/metrics")
+    print("metrics", mock.method(idx), mock.path(idx), "metrics-header", mock.header(idx, "X-Metrics"))
+    doc: json = mock.bodyJson(idx)
+    serviceName: str = ""
+    for a in Json.toList(doc.resourceMetrics[0].resource.attributes).unwrap() {
+        kv: json = Json.fromValue(a).unwrap()
+        k: str = kv.key
+        if k == "service.name" {
+            serviceName = kv.value.stringValue
+        }
+    }
+    scopeName: str = doc.resourceMetrics[0].scopeMetrics[0].scope.name
+    scopeVersion: str = doc.resourceMetrics[0].scopeMetrics[0].scope.version
+    print("metrics resource", serviceName, "scope", scopeName, scopeVersion)
+    sumMetric: json = findMetric(doc, "stock.moves")
+    mono: bool = sumMetric.sum.isMonotonic
+    temporality: int = sumMetric.sum.aggregationTemporality
+    asInt: str = sumMetric.sum.dataPoints[0].asInt
+    print("sum stock.moves", mono, temporality, "asInt", asInt)
+    gauge: json = findMetric(doc, "stock.level")
+    gv: float = gauge.gauge.dataPoints[0].asDouble
+    print("gauge stock.level asDouble", gv)
+    hist: json = findMetric(doc, "pick.duration")
+    hp: json = hist.histogram.dataPoints[0]
+    hcount: str = hp.count
+    hsum: float = float(hp.sum)
+    hmin: float = float(hp.min)
+    hmax: float = float(hp.max)
+    print("histogram pick.duration count", hcount, "sum", hsum, "buckets", len(hp.bucketCounts), "bounds", len(hp.explicitBounds), "min", hmin, "max", hmax)
+
+    periodicMock: OtelMockCollector = OtelMockCollector()
+    pcfg: OtelConfig = OtelConfig("periodic", periodicMock.url, "", 3000)
+    pcfg.metricExportIntervalMs = 50
+    periodic: OtelMeterProvider = OtelMeterProvider(pcfg.resource())
+    periodic.addReader(OtelMetricReader.fromConfig(OtelOtlpMetricExporter(pcfg), pcfg))
+    periodic.meter("p").counter("ticks").add(1)
+    print("periodic exports", periodicMock.waitFor(2, 5000))
+    periodic.shutdown()
+    periodicMock.close()
+
+    logs: OtelLoggerProvider = OtelLoggerProvider(cfg.resource())
+    logs.addProcessor(OtelBatchLogProcessor.fromConfig(OtelOtlpLogExporter(cfg), cfg))
+    logger: OtelLogger = logs.logger("warehouse.logs")
+    span: OtelSpan = OtelSpan("restock")
+    logger.warn("low stock", {"sku": "A-1"}, span.spanContext())
+    logs.forceFlush()
+    li: int = mock.lastIndexFor("/v1/logs")
+    print("logs", mock.method(li), mock.path(li), "logs-header", mock.header(li, "X-Logs"))
+    ldoc: json = mock.bodyJson(li)
+    rec: json = ldoc.resourceLogs[0].scopeLogs[0].logRecords[0]
+    sev: int = rec.severityNumber
+    sevText: str = rec.severityText
+    body: str = rec.body.stringValue
+    print("log record severity", sev, sevText, "body", body)
+    tid: str = rec.traceId
+    sid: str = rec.spanId
+    print("log trace correlation", tid == span.traceId, sid == span.spanId)
+    key: str = rec.attributes[0].key
+    val: str = rec.attributes[0].value.stringValue
+    print("log attributes", key, "stringValue", val)
+    lscope: str = ldoc.resourceLogs[0].scopeLogs[0].scope.name
+    print("logs scope", lscope)
+
+    before: int = mock.countPath("/v1/metrics")
+    moves.add(1, {"dir": "out"})
+    _ = meters.shutdown()
+    _ = logs.shutdown()
+    print("shutdown final export", mock.countPath("/v1/metrics") == before + 1)
+    mock.close()
+}

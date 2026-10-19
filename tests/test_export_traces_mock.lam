@@ -1,0 +1,141 @@
+# OTLP/HTTP JSON trace export against an ephemeral local collector: request
+# line, headers (including OTEL_EXPORTER_OTLP_HEADERS), and the exact shape
+# of the ExportTraceServiceRequest JSON.
+#
+# expect: ok true status 200 attempts 1 items 2
+# expect: POST /v1/traces
+# expect: application/json true
+# expect: auth Bearer t0k=n team ops trace-only yes
+# expect: resource checkout-api 1.4.2 staging eu-west-1
+# expect: telemetry.sdk.name @lam/otel
+# expect: scope shop.checkout 3.1.0
+# expect: spans 2
+# expect: child charge kind 3 parent-linked true
+# expect: ids hex true true
+# expect: times string true end>=start true
+# expect: status 2 card declined
+# expect: attr amount intValue 1999
+# expect: attr gateway stringValue stripe
+# expect: attr ratio doubleValue 0.5
+# expect: attr retry boolValue true
+# expect: attr tags arrayValue a,b
+# expect: event exception exception.type=GatewayError
+# expect: link 1 abababababababababababababababab
+# expect: root GET /checkout kind 2 status 1 no-parent true
+# expect: flags 257
+# expect: payload helper matches true
+
+from @lam/otel import OtelConfig, OtelTracerProvider, OtelTracer, OtelSpan, OtelSpanKind, OtelStatusCode, OtelOtlpSpanExporter, OtelExportResult, OtelSpanContext, OtelSpanLink, OtelResource, Otel
+from otelmock import OtelMockCollector
+from lamerrors import Result, Error
+from lamjson import Json
+
+func main() {
+    mock: OtelMockCollector = OtelMockCollector()
+    cfg: OtelConfig = OtelConfig("checkout-api", mock.url + "/", "Authorization=Bearer t0k%3Dn, x-team = ops", 5000)
+    cfg.tracesHeaders = "x-signal=yes"
+    cfg.serviceVersion = "1.4.2"
+    cfg.environment = "staging"
+    cfg.resourceAttributes = {"cloud.region": "eu-west-1", "service.name": "ignored"}
+    provider: OtelTracerProvider = OtelTracerProvider(cfg.resource())
+    tracer: OtelTracer = provider.tracer("shop.checkout", "3.1.0")
+
+    root: OtelSpan = tracer.startSpan("GET /checkout", OtelSpanKind.SERVER)
+    root.setStatus(OtelStatusCode.OK)
+    child: OtelSpan = tracer.childSpan(root, "charge", OtelSpanKind.CLIENT, {"gateway": "stripe", "amount": 1999})
+    child.setAttribute("retry", true)
+    child.setAttribute("ratio", 0.5)
+    child.setAttribute("tags", ["a", "b"])
+    child.recordError(Error("GatewayError", "card declined"))
+    child.setStatus(OtelStatusCode.ERROR, "card declined")
+    child.addLink(OtelSpanContext("abababababababababababababababab", "cdcdcdcdcdcdcdcd", 1), {"messaging.batch": 1})
+    child.end()
+    root.end()
+
+    exporter: OtelOtlpSpanExporter = OtelOtlpSpanExporter(cfg)
+    spans: list[OtelSpan] = [child, root]
+    res: Result[OtelExportResult] = exporter.export(spans)
+    r: OtelExportResult = res.unwrap()
+    print("ok", r.ok(), "status", r.status, "attempts", r.attempts, "items", r.items)
+    print(mock.method(0), mock.path(0))
+    print(mock.header(0, "Content-Type"), mock.header(0, "User-Agent").startsWith("lam-otel/"))
+    print("auth", mock.header(0, "Authorization"), "team", mock.header(0, "X-Team"), "trace-only", mock.header(0, "X-Signal"))
+
+    doc: json = mock.bodyJson(0)
+    rs: json = doc.resourceSpans[0]
+    attrs: dict[str, str] = {}
+    for a in Json.toList(rs.resource.attributes).unwrap() {
+        kv: json = Json.fromValue(a).unwrap()
+        key: str = kv.key
+        value: str = kv.value.stringValue
+        attrs[key] = value
+    }
+    print("resource", attrs["service.name"], attrs["service.version"], attrs["deployment.environment"], attrs["cloud.region"])
+    print("telemetry.sdk.name", attrs["telemetry.sdk.name"])
+    ss: json = rs.scopeSpans[0]
+    scopeName: str = ss.scope.name
+    scopeVersion: str = ss.scope.version
+    print("scope", scopeName, scopeVersion)
+    print("spans", len(ss.spans))
+
+    c: json = ss.spans[0]
+    p: json = ss.spans[1]
+    cname: str = c.name
+    ckind: int = c.kind
+    cparent: str = c.parentSpanId
+    pspan: str = p.spanId
+    print("child", cname, "kind", ckind, "parent-linked", cparent == pspan)
+    ctrace: str = c.traceId
+    print("ids hex", len(ctrace) == 32 and ctrace == child.traceId, len(pspan) == 16)
+    cstart: str = c.startTimeUnixNano
+    cend: str = c.endTimeUnixNano
+    print("times string", Json.kind(c.startTimeUnixNano) == "string", "end>=start", int(cend) >= int(cstart))
+    scode: int = c.status.code
+    smsg: str = c.status.message
+    print("status", scode, smsg)
+    for a in Json.toList(c.attributes).unwrap() {
+        kv: json = Json.fromValue(a).unwrap()
+        key: str = kv.key
+        if key == "amount" {
+            v: str = kv.value.intValue
+            print("attr amount intValue", v)
+        } elif key == "gateway" {
+            v: str = kv.value.stringValue
+            print("attr gateway stringValue", v)
+        } elif key == "retry" {
+            v: bool = kv.value.boolValue
+            print("attr retry boolValue", v)
+        } elif key == "ratio" {
+            v: float = kv.value.doubleValue
+            print("attr ratio doubleValue", v)
+        } elif key == "tags" {
+            first: str = kv.value.arrayValue.values[0].stringValue
+            second: str = kv.value.arrayValue.values[1].stringValue
+            print("attr tags arrayValue", first + "," + second)
+        }
+    }
+    ev: json = c.events[0]
+    evName: str = ev.name
+    evType: str = ""
+    for a in Json.toList(ev.attributes).unwrap() {
+        kv: json = Json.fromValue(a).unwrap()
+        key: str = kv.key
+        if key == "exception.type" {
+            evType = kv.value.stringValue
+        }
+    }
+    print("event", evName, "exception.type=" + evType)
+    linkTrace: str = c.links[0].traceId
+    print("link", len(c.links), linkTrace)
+    pname: str = p.name
+    pkind: int = p.kind
+    pcode: int = p.status.code
+    print("root", pname, "kind", pkind, "status", pcode, "no-parent", p.parentSpanId == None)
+    pflags: int = p.flags
+    print("flags", pflags)
+
+    helper: json = Otel.tracesPayload(spans)
+    sent: json = mock.bodyJson(0)
+    print("payload helper matches", helper == sent)
+    mock.close()
+}

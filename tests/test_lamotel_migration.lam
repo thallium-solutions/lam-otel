@@ -1,0 +1,108 @@
+# The lamotel 0.2.1 scenarios (config/payload, opinionated tracing, mock
+# export, composed checkout) rewritten for the @lam/otel 1.0 API: the
+# migration path documented in the README and CHANGELOG.
+#
+# expect: default service unknown_service http://localhost:4318/v1/traces
+# expect: env url true headers true true token abc=123
+# expect: resource checkout-api 1.2.3 prod payments
+# expect: trace linked true true
+# expect: recordException keeps status 0 fail sets 2 card declined
+# expect: events [exception exception]
+# expect: ok status 1 authorized-dropped true
+# expect: kinds 2 3 parsed 3
+# expect: context values true true false
+# expect: batch size 2
+# expect: payload service checkout-api spans 2 order.id ord_123
+# expect: batch export ok true POST /v1/traces auth Bearer local-token
+# expect: body has deployment.environment true charge true
+# expect: rejected true collector status 503 true requests 2
+# expect: missing endpoint OtelConfigError
+# expect: legacy helpers 32 16
+
+from @lam/otel import Otel, OtelConfig, OtelResource, OtelTracer, OtelSpan, OtelSpanBatch, OtelSpanKind, OtelStatusCode, OtelExportResult
+from otelmock import OtelMockCollector
+from lamcontext import Context
+from lamenv import Env
+from lamerrors import Result
+
+func contextString(value: any) -> str {
+    return str(value)
+}
+
+func main() {
+    cfg0: OtelConfig = OtelConfig.fromEnv()
+    print("default service", cfg0.serviceName, cfg0.tracesUrl())
+
+    _ = Env.set("OTEL_SERVICE_NAME", "checkout-api")
+    _ = Env.set("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318/")
+    _ = Env.set("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer abc,X-Team=payments,token=abc=123")
+    _ = Env.set("OTEL_SERVICE_VERSION", "1.2.3")
+    _ = Env.set("OTEL_DEPLOYMENT_ENVIRONMENT", "prod")
+    _ = Env.set("OTEL_RESOURCE_ATTRIBUTES", "team=payments,region=eu")
+    cfg: OtelConfig = OtelConfig.fromEnv()
+    headers: dict[str, str] = Otel.parseHeaders(cfg.headers)
+    print("env url", cfg.tracesUrl() == "http://collector:4318/v1/traces", "headers", headers["Authorization"] == "Bearer abc", headers["X-Team"] == "payments", "token", headers["token"])
+    resource: OtelResource = cfg.resource()
+    print("resource", resource.getString("service.name"), resource.getString("service.version"), resource.getString("deployment.environment"), resource.getString("team"))
+
+    cfg.tracesExporter = "none"
+    tracer: OtelTracer = OtelTracer.fromConfig(cfg)
+    parent: OtelSpan = tracer.startSpan("checkout", OtelSpanKind.SERVER)
+    parent.setAttribute("order.id", "ord_123")
+    child: OtelSpan = tracer.childSpan(parent, "stripe.create_payment_intent", OtelSpanKind.CLIENT)
+    print("trace linked", child.traceId == parent.traceId, child.parentSpanId == parent.spanId)
+    child.recordException("card declined")
+    first: int = child.statusCode
+    child.fail("card declined")
+    print("recordException keeps status", first, "fail sets", child.statusCode, child.statusMessage)
+    print("events", child.eventNames())
+    child.end()
+    parent.setStatus(OtelStatusCode.parse("OK"), "authorized")
+    print("ok status", parent.statusCode, "authorized-dropped", parent.statusMessage == "")
+    parent.end()
+    print("kinds", parent.kind, child.kind, "parsed", OtelSpanKind.parse("client"))
+
+    traceContext: Context = Context.simple().valued("trace.id", parent.traceId)
+    spanContext: Context = traceContext.valued("span.id", child.spanId)
+    print("context values", contextString(spanContext.get("trace.id")) == parent.traceId, contextString(spanContext.get("span.id")) == child.spanId, traceContext.has("span.id"))
+
+    batch: OtelSpanBatch = tracer.batch()
+    batch.add(parent)
+    batch.add(child)
+    print("batch size", batch.size())
+    payload: json = Otel.tracesPayload(batch.spans)
+    attrs: json = payload.resourceSpans[0].resource.attributes
+    service: str = ""
+    i: int = 0
+    while i < len(attrs) {
+        k: str = attrs[i].key
+        if k == "service.name" {
+            service = attrs[i].value.stringValue
+        }
+        i += 1
+    }
+    orderId: str = payload.resourceSpans[0].scopeSpans[0].spans[0].attributes[0].value.stringValue
+    print("payload service", service, "spans", len(payload.resourceSpans[0].scopeSpans[0].spans), "order.id", orderId)
+
+    mock: OtelMockCollector = OtelMockCollector([200, 503])
+    local: OtelConfig = OtelConfig.fromEnv()
+    local.endpoint = mock.url
+    local.headers = "Authorization=Bearer local-token"
+    local.retryMaxAttempts = 1
+    local.tracesExporter = "none"
+    exporting: OtelTracer = OtelTracer.fromConfig(local)
+    accepted: Result[OtelExportResult] = batch.export(exporting)
+    print("batch export ok", accepted.ok(), mock.method(0), mock.path(0), "auth", mock.header(0, "Authorization"))
+    print("body has deployment.environment", mock.body(0).contains("deployment.environment"), "charge", mock.body(0).contains("stripe.create_payment_intent"))
+    rejected: Result[OtelExportResult] = exporting.exportSpan(parent)
+    print("rejected", not rejected.ok(), "collector status 503", str(rejected.error).contains("status 503"), "requests", mock.count())
+    mock.close()
+
+    missing: OtelTracer = OtelTracer.fromConfig(OtelConfig("missing-endpoint", ""))
+    missingResult: Result[OtelExportResult] = missing.exportSpan(parent)
+    print("missing endpoint", missingResult.error.kind)
+    print("legacy helpers", len(Otel.idsTrace()), len(Otel.idsSpan()))
+    _ = tracer.provider.shutdown()
+    _ = exporting.provider.shutdown()
+    _ = missing.provider.shutdown()
+}

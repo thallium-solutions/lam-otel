@@ -1,0 +1,153 @@
+# Metrics API and aggregation: counters, up-down counters, gauges,
+# histograms (explicit buckets), observable instruments, cumulative
+# temporality, cardinality limit, name validation, no-op provider.
+#
+# expect: counter /a 3 /b 1 monotonic true kind sum
+# expect: counter negative ignored 3
+# expect: counter float switches to double true 3.5
+# expect: same instrument true
+# expect: updown 2 monotonic false
+# expect: gauge last value 21.5 int gauge 7 isDouble false
+# expect: histogram count 5 sum 1160.5 min 5 max 1000
+# expect: buckets [2 2 0 1] bounds [10 100 500]
+# expect: boundary value goes to lower bucket true
+# expect: default bounds 15 buckets 16
+# expect: cumulative 3 then 8 same start true later time true
+# expect: attributes order-independent 1 point value 2
+# expect: observable gauge 42 heap counter 100 updown -3
+# expect: observable reobserved 1 points
+# expect: callback panic tolerated true
+# expect: overflow points 3 overflow value 3
+# expect: invalid name ignored 0 valid true false
+# expect: scope shop 2.0
+# expect: noop provider records nothing 0
+# expect: shutdown stops recording 8 exports refused after shutdown true
+
+from @lam/otel import OtelMeterProvider, OtelMeter, OtelCounter, OtelUpDownCounter, OtelGauge, OtelHistogram, OtelMetricReader, OtelInMemoryMetricExporter, OtelMetricData, OtelMetricPoint, OtelObservableResult, OtelObservableInstrument
+
+class Pool {
+    func init(self) {
+        self.size: int = 42
+        self.total: int = 100
+    }
+
+    func observe(self, result: OtelObservableResult) {
+        result.observe(self.size, {"kind": "heap"})
+    }
+}
+
+func latest(reader: OtelMetricReader, mem: OtelInMemoryMetricExporter, name: str) -> OtelMetricData {
+    reader.forceFlush()
+    return mem.find(name)
+}
+
+func failing(result: OtelObservableResult) {
+    _ = result
+    throw ValueError("callback failed")
+}
+
+func main() {
+    mem: OtelInMemoryMetricExporter = OtelInMemoryMetricExporter()
+    reader: OtelMetricReader = OtelMetricReader(mem, 0)
+    provider: OtelMeterProvider = OtelMeterProvider()
+    provider.addReader(reader)
+    meter: OtelMeter = provider.meter("shop", "2.0")
+
+    c: OtelCounter = meter.counter("http.requests", "{request}", "Handled requests")
+    c.add(1, {"route": "/a"})
+    c.add(2, {"route": "/a"})
+    c.add(1, {"route": "/b"})
+    requests: OtelMetricData = latest(reader, mem, "http.requests")
+    print("counter /a", requests.point({"route": "/a"}).intValue, "/b", requests.point({"route": "/b"}).intValue, "monotonic", requests.monotonic, "kind", requests.kind)
+    c.add(-5, {"route": "/a"})
+    c.addFloat(-1.5, {"route": "/a"})
+    print("counter negative ignored", latest(reader, mem, "http.requests").point({"route": "/a"}).intValue)
+    c.addFloat(0.5, {"route": "/a"})
+    pa: OtelMetricPoint = latest(reader, mem, "http.requests").point({"route": "/a"})
+    print("counter float switches to double", pa.isDouble, pa.doubleValue)
+    print("same instrument", meter.counter("http.requests") == c)
+
+    u: OtelUpDownCounter = meter.upDownCounter("queue.length")
+    u.add(3)
+    u.add(-1)
+    ud: OtelMetricData = latest(reader, mem, "queue.length")
+    print("updown", ud.point().intValue, "monotonic", ud.monotonic)
+
+    g: OtelGauge = meter.gauge("room.temperature", "Cel")
+    g.recordFloat(19.0)
+    g.recordFloat(21.5)
+    g2: OtelGauge = meter.gauge("pool.size")
+    g2.recordFloat(1.5)
+    g2.record(7)
+    print("gauge last value", latest(reader, mem, "room.temperature").point().doubleValue, "int gauge", latest(reader, mem, "pool.size").point().intValue, "isDouble", mem.find("pool.size").point().isDouble)
+
+    h: OtelHistogram = meter.histogram("http.duration", "ms", "", [500.0, 10.0, 100.0])
+    h.record(5)
+    h.record(50)
+    h.recordFloat(100.0)
+    h.recordFloat(5.5)
+    h.record(1000)
+    hp: OtelMetricPoint = latest(reader, mem, "http.duration").point()
+    print("histogram count", hp.count, "sum", hp.sum, "min", hp.min, "max", hp.max)
+    print("buckets", hp.bucketCounts, "bounds", hp.explicitBounds)
+    print("boundary value goes to lower bucket", hp.bucketCounts[1] == 2)
+    dh: OtelHistogram = meter.histogram("default.bounds")
+    dh.record(1)
+    print("default bounds", len(dh.boundaries()), "buckets", len(latest(reader, mem, "default.bounds").point().bucketCounts))
+
+    cum: OtelCounter = meter.counter("cumulative")
+    cum.add(3)
+    first: OtelMetricPoint = latest(reader, mem, "cumulative").point()
+    cum.add(5)
+    second: OtelMetricPoint = latest(reader, mem, "cumulative").point()
+    print("cumulative", first.intValue, "then", second.intValue, "same start", first.startTimeUnixNano == second.startTimeUnixNano and first.startTimeUnixNano == provider.startTimeUnixNano, "later time", second.timeUnixNano >= first.timeUnixNano)
+
+    o: OtelCounter = meter.counter("ordered")
+    o.add(1, {"a": 1, "b": "x"})
+    o.add(1, {"b": "x", "a": 1})
+    od: OtelMetricData = latest(reader, mem, "ordered")
+    print("attributes order-independent", len(od.points), "point value", od.point({"a": 1, "b": "x"}).intValue)
+
+    pool: Pool = Pool()
+    meter.observableGauge("pool.memory", pool.observe, "By")
+    meter.observableCounter("pool.total", lambda r: r.observe(pool.total))
+    meter.observableUpDownCounter("pool.delta", lambda r: r.observeFloat(-3.0))
+    gm: OtelMetricData = latest(reader, mem, "pool.memory")
+    print("observable gauge", gm.point({"kind": "heap"}).intValue, gm.point({"kind": "heap"}).attributes["kind"], "counter", mem.find("pool.total").point().intValue, "updown", mem.find("pool.delta").point().doubleValue)
+    pool.size = 7
+    print("observable reobserved", len(latest(reader, mem, "pool.memory").points), "points")
+    meter.observableGauge("broken", failing)
+    flushed: bool = reader.forceFlush().ok()
+    print("callback panic tolerated", flushed and mem.find("broken") == None)
+
+    provider.cardinalityLimit = 3
+    many: OtelCounter = meter.counter("cardinality")
+    for i in range(5) {
+        many.add(1, {"user": str(i)})
+    }
+    md: OtelMetricData = latest(reader, mem, "cardinality")
+    print("overflow points", len(md.points), "overflow value", md.point({"otel.metric.overflow": true}).intValue)
+    provider.cardinalityLimit = 2000
+
+    bad: OtelCounter = meter.counter("1-invalid name")
+    bad.add(1)
+    reader.forceFlush()
+    print("invalid name ignored", len(bad.order), "valid", OtelMeter.validName("http.server.request_duration/x-y"), OtelMeter.validName("_x"))
+    print("scope", requests.scopeName, requests.scopeVersion)
+
+    noop: OtelMeterProvider = OtelMeterProvider.noop()
+    nc: OtelCounter = noop.meter("x").counter("c")
+    nc.add(5)
+    print("noop provider records nothing", len(noop.collect()))
+
+    provider.shutdown()
+    cum.add(100)
+    value: int = -1
+    for item in provider.collect() {
+        data: OtelMetricData = item
+        if data.name == "cumulative" {
+            value = data.point().intValue
+        }
+    }
+    print("shutdown stops recording", value, "exports refused after shutdown", not reader.forceFlush().ok() or mem.stopped)
+}

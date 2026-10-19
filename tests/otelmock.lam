@@ -1,0 +1,250 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ephemeral local OTLP/HTTP collector used by the @lam/otel tests. It
+# listens on 127.0.0.1 with a random port, records every request (method,
+# path, headers, body — gunzipped when Content-Encoding is gzip) and answers
+# with a scripted list of statuses (200 once the script is exhausted).
+
+from lamjson import Json
+from lamerrors import Result
+
+go! {
+    import (
+        "bytes"
+        "compress/gzip"
+        "fmt"
+        "io"
+        "net"
+        "net/http"
+        "strings"
+        "sync"
+        "time"
+    )
+
+    type otelMockRequest struct {
+        method  string
+        path    string
+        headers http.Header
+        body    string
+    }
+
+    type otelMockState struct {
+        mu         sync.Mutex
+        server     *http.Server
+        requests   []otelMockRequest
+        statuses   []int
+        retryAfter string
+        delayMs    int
+        response   string
+    }
+
+    func otelMockStart(state *otelMockState) string {
+        listener, err := net.Listen("tcp", "127.0.0.1:0")
+        if err != nil {
+            panic(err)
+        }
+        mux := http.NewServeMux()
+        mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+            raw, _ := io.ReadAll(r.Body)
+            _ = r.Body.Close()
+            if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+                if zr, err := gzip.NewReader(bytes.NewReader(raw)); err == nil {
+                    if plain, err := io.ReadAll(zr); err == nil {
+                        raw = plain
+                    }
+                }
+            }
+            state.mu.Lock()
+            state.requests = append(state.requests, otelMockRequest{r.Method, r.URL.Path, r.Header.Clone(), string(raw)})
+            index := len(state.requests) - 1
+            status := 200
+            if index < len(state.statuses) {
+                status = state.statuses[index]
+            }
+            retryAfter := state.retryAfter
+            delay := state.delayMs
+            response := state.response
+            state.mu.Unlock()
+            if delay > 0 {
+                time.Sleep(time.Duration(delay) * time.Millisecond)
+            }
+            w.Header().Set("Content-Type", "application/json")
+            if retryAfter != "" && status != 200 {
+                w.Header().Set("Retry-After", retryAfter)
+            }
+            w.WriteHeader(status)
+            if status >= 200 && status < 300 {
+                _, _ = fmt.Fprint(w, response)
+            } else {
+                _, _ = fmt.Fprintf(w, `{"code":%d,"message":"mock status %d"}`, status, status)
+            }
+        })
+        state.server = &http.Server{Handler: mux}
+        go func() { _ = state.server.Serve(listener) }()
+        return fmt.Sprintf("http://127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port)
+    }
+
+    func otelMockFreePort() string {
+        listener, err := net.Listen("tcp", "127.0.0.1:0")
+        if err != nil {
+            panic(err)
+        }
+        port := listener.Addr().(*net.TCPAddr).Port
+        _ = listener.Close()
+        return fmt.Sprintf("http://127.0.0.1:%d", port)
+    }
+}
+
+class OtelMockCollector {
+    #- A local OTLP/HTTP collector for tests. -#
+
+    func init(self, statuses: list[int] = [], retryAfter: str = "", delayMs: int = 0, response: str = "{}") {
+        self.state: any = None
+        self.url: str = ""
+        go! {
+            st := &otelMockState{statuses: append([]int(nil), statuses...), retryAfter: retryAfter, delayMs: delayMs, response: response}
+            s.State = st
+            s.Url = otelMockStart(st)
+        }
+    }
+
+    static func unusedUrl() -> str {
+        #- A URL on a port where nothing listens. -#
+        return go!(otelMockFreePort())
+    }
+
+    func count(self) -> int {
+        #- Requests received so far. -#
+        n: int = 0
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            n = len(st.requests)
+            st.mu.Unlock()
+        }
+        return n
+    }
+
+    func countPath(self, path: str) -> int {
+        #- Requests received for ``path``. -#
+        n: int = 0
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            for _, r := range st.requests {
+                if r.path == path {
+                    n++
+                }
+            }
+            st.mu.Unlock()
+        }
+        return n
+    }
+
+    func waitFor(self, n: int, timeoutMs: int = 5000) -> bool {
+        #- Wait until ``n`` requests arrived. -#
+        waited: int = 0
+        while self.count() < n {
+            if waited >= timeoutMs {
+                return false
+            }
+            go! {
+                time.Sleep(10 * time.Millisecond)
+            }
+            waited += 10
+        }
+        return true
+    }
+
+    func method(self, i: int) -> str {
+        #- HTTP method of request ``i``. -#
+        out: str = ""
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            if i >= 0 && i < len(st.requests) {
+                out = st.requests[i].method
+            }
+            st.mu.Unlock()
+        }
+        return out
+    }
+
+    func path(self, i: int) -> str {
+        #- URL path of request ``i``. -#
+        out: str = ""
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            if i >= 0 && i < len(st.requests) {
+                out = st.requests[i].path
+            }
+            st.mu.Unlock()
+        }
+        return out
+    }
+
+    func header(self, i: int, name: str) -> str {
+        #- Header ``name`` of request ``i``. -#
+        out: str = ""
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            if i >= 0 && i < len(st.requests) {
+                out = st.requests[i].headers.Get(name)
+            }
+            st.mu.Unlock()
+        }
+        return out
+    }
+
+    func body(self, i: int) -> str {
+        #- Body of request ``i`` (decompressed). -#
+        out: str = ""
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            if i >= 0 && i < len(st.requests) {
+                out = st.requests[i].body
+            }
+            st.mu.Unlock()
+        }
+        return out
+    }
+
+    func bodyJson(self, i: int) -> json {
+        #- Body of request ``i`` decoded as JSON (``None`` when invalid). -#
+        decoded: Result[json] = Json.decode(self.body(i))
+        if not decoded.ok() {
+            return None
+        }
+        return decoded.unwrap()
+    }
+
+    func lastIndexFor(self, path: str) -> int {
+        #- Index of the last request for ``path`` (``-1`` when none). -#
+        out: int = -1
+        go! {
+            st := s.State.(*otelMockState)
+            st.mu.Lock()
+            for idx, r := range st.requests {
+                if r.path == path {
+                    out = idx
+                }
+            }
+            st.mu.Unlock()
+        }
+        return out
+    }
+
+    func close(self) {
+        #- Stop the server. -#
+        go! {
+            st := s.State.(*otelMockState)
+            if st.server != nil {
+                _ = st.server.Close()
+            }
+        }
+    }
+}

@@ -1,0 +1,18 @@
+@lam/otel
+
+Copyright 2026 Thallium Solutions di Busconi Alessandro.
+
+This product includes software developed by Thallium Solutions di Busconi
+Alessandro.
+
+@lam/otel is a Lammergeier third-party library for OpenTelemetry: tracing,
+metrics and logs exported as OTLP/HTTP JSON, with W3C Trace Context and
+Baggage propagation. It has no third-party dependencies: it is built only on
+the Lammergeier standard library and the Go standard library.
+
+It implements the OpenTelemetry specification, the OTLP protocol and the W3C
+Trace Context and Baggage recommendations. OpenTelemetry is a project of the
+Cloud Native Computing Foundation; no OpenTelemetry source code is included.
+
+@lam/otel 1.0.0 supersedes the `lamotel` 0.2.1 package that was vendored in
+the Lammergeier compiler repository under the MIT license.

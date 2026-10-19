@@ -1,0 +1,311 @@
+# Composed scenario: an instrumented checkout handler continues incoming
+# W3C traces, propagates trace context and baggage to a downstream HTTP
+# service, records metrics and correlated logs, handles a failing call with
+# Result/?/do-catch, and exports everything through the global SDK to an
+# ephemeral collector (batch processors, a custom processor and a tee
+# exporter implemented by the test through the public interfaces).
+#
+# expect: responses 200 200 502
+# expect: downstream calls 3 traceparent forwarded true baggage tenant=acme true
+# expect: downstream parent is client span true
+# expect: continued trace true remote parent 00f067aa0ba902b7
+# expect: fresh trace for request without headers true
+# expect: custom processor started 6 ended 6 enriched true
+# expect: tee copies 8 spans
+# expect: collector traces requests >= 1 true spans 8
+# expect: server spans 3 client spans 3 internal 2 error spans 3
+# expect: failing span status message downstream returned 500
+# expect: exception event on client span true
+# expect: generic traced value 42 err TracedError
+# expect: metrics requests 200=2 502=1 histogram count 3 active 0
+# expect: logs 3 correlated true error log severity 17
+# expect: shutdown ok true
+
+from @lam/otel import Otel, OtelSdk, OtelConfig, OtelTracer, OtelSpan, OtelSpanKind, OtelStatusCode, OtelSpanContext, OtelBaggage, OtelMeter, OtelCounter, OtelHistogram, OtelUpDownCounter, OtelLogger, OtelExportResult, OtelOtlpSpanExporter, OtelInMemorySpanExporter, OtelBatchSpanProcessor
+from otelmock import OtelMockCollector
+from lamerrors import Result, Error
+from lamhttp import HttpClient, HttpResponse, HttpRequestOptions
+from lamjson import Json
+from lamtime import Time
+
+class TeeExporter {
+    #- Sends every batch to the collector and keeps a copy in memory. -#
+    func init(self, primary: OtelOtlpSpanExporter, copy: OtelInMemorySpanExporter) {
+        self.primary: OtelOtlpSpanExporter = primary
+        self.copy: OtelInMemorySpanExporter = copy
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        _ = self.copy.export(spans)
+        return self.primary.export(spans)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        _ = self.copy.shutdown()
+        return self.primary.shutdown()
+    }
+}
+
+class EnrichingProcessor {
+    func init(self, region: str) {
+        self.region: str = region
+        self.started: int = 0
+        self.ended: int = 0
+    }
+
+    func onStart(self, span: OtelSpan) {
+        self.started += 1
+        span.setAttribute("cloud.region", self.region)
+    }
+
+    func onEnd(self, span: OtelSpan) {
+        _ = span
+        self.ended += 1
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+class Response {
+    func init(self, status: int, body: str) {
+        self.status: int = status
+        self.body: str = body
+    }
+}
+
+class CheckoutService {
+    func init(self, downstreamUrl: str) {
+        self.downstreamUrl: str = downstreamUrl
+        self.tracer: OtelTracer = Otel.tracer("shop.checkout", "1.0.0")
+        meter: OtelMeter = Otel.meter("shop.checkout", "1.0.0")
+        self.requests: OtelCounter = meter.counter("http.server.requests", "{request}")
+        self.duration: OtelHistogram = meter.histogram("http.server.duration", "ms")
+        self.active: OtelUpDownCounter = meter.upDownCounter("http.server.active_requests")
+        self.logger: OtelLogger = Otel.logger("shop.checkout")
+        self.client: HttpClient = HttpClient("", 2000)
+        self.lastServerSpan: OtelSpan = None
+        self.lastClientSpan: OtelSpan = None
+    }
+
+    func callDownstream(self, parent: OtelSpan, baggage: OtelBaggage) -> Result[str] {
+        span: OtelSpan = self.tracer.childSpan(parent, "GET /inventory", OtelSpanKind.CLIENT, {"http.request.method": "GET"})
+        self.lastClientSpan = span
+        headers: dict[str, str] = {}
+        Otel.inject(headers, span.spanContext(), baggage)
+        options: HttpRequestOptions = HttpRequestOptions()
+        for k, v in headers {
+            options.header(k, v)
+        }
+        response: Result[HttpResponse] = self.client.request("GET", self.downstreamUrl + "/inventory", options)
+        if not response.ok() {
+            span.recordError(Error("TransportError", str(response.error)))
+            span.setStatus(OtelStatusCode.ERROR, "transport failure")
+            span.end()
+            return Result.Err(Error("DownstreamError", "transport failure", response.error))
+        }
+        res: HttpResponse = response.unwrap()
+        span.setAttribute("http.response.status_code", res.status)
+        if res.status >= 500 {
+            message: str = "downstream returned " + str(res.status)
+            span.recordError(Error("DownstreamError", message))
+            span.setStatus(OtelStatusCode.ERROR, message)
+            span.end()
+            return Result.Err(Error("DownstreamError", message))
+        }
+        span.end()
+        return Result.Ok(res.body)
+    }
+
+    func process(self, span: OtelSpan, baggage: OtelBaggage) -> Result[Response] {
+        body: str = self.callDownstream(span, baggage)?
+        return Result.Ok(Response(200, body))
+    }
+
+    func handle(self, headers: dict[str, str]) -> Response {
+        started: int = Time.nowUnixMilli()
+        parent: OtelSpanContext = Otel.extract(headers)
+        baggage: OtelBaggage = Otel.extractBaggage(headers)
+        span: OtelSpan = self.tracer.startSpan("POST /checkout", OtelSpanKind.SERVER, parent, {"http.request.method": "POST", "http.route": "/checkout"})
+        self.lastServerSpan = span
+        self.active.add(1)
+        out: Response = Response(500, "")
+        do {
+            out = self.process(span, baggage)?
+            self.logger.info("checkout completed", {"tenant": baggage.get("tenant")}, span.spanContext())
+        } catch err {
+            out = Response(502, err.message)
+            span.setStatus(OtelStatusCode.ERROR, err.message)
+            self.logger.error("checkout failed: " + err.message, {"error.type": err.kind}, span.spanContext())
+        }
+        span.setAttribute("http.response.status_code", out.status)
+        span.end()
+        self.active.add(-1)
+        attrs: dict[str, any] = {"http.response.status_code": out.status}
+        self.requests.add(1, attrs)
+        self.duration.record(Time.nowUnixMilli() - started, attrs)
+        return out
+    }
+}
+
+func traced[T](tracer: OtelTracer, name: str, fn: func(OtelSpan) -> Result[T]) -> Result[T] {
+    span: OtelSpan = tracer.startSpan(name)
+    result: Result[T] = fn(span)
+    if not result.ok() {
+        span.fail(str(result.error))
+    }
+    span.end()
+    return result
+}
+
+func answer(span: OtelSpan) -> Result[int] {
+    span.setAttribute("answer", true)
+    return Result.Ok(42)
+}
+
+func broken(span: OtelSpan) -> Result[int] {
+    _ = span
+    return Result.Err(Error("TracedError", "nope"))
+}
+
+func countKind(doc: json, kind: int) -> int {
+    n: int = 0
+    spans: json = doc.resourceSpans[0].scopeSpans[0].spans
+    i: int = 0
+    while i < len(spans) {
+        k: int = spans[i].kind
+        if k == kind {
+            n += 1
+        }
+        i += 1
+    }
+    return n
+}
+
+func main() {
+    collector: OtelMockCollector = OtelMockCollector()
+    downstream: OtelMockCollector = OtelMockCollector([200, 200, 500], "", 0, "{\"stock\":7}")
+
+    cfg: OtelConfig = OtelConfig("checkout-svc", collector.url, "x-api-key=secret", 3000)
+    cfg.tracesExporter = "none"
+    cfg.bspScheduleDelayMs = 600000
+    cfg.metricExportIntervalMs = 600000
+    cfg.blrpScheduleDelayMs = 600000
+    sdk: OtelSdk = Otel.setup(cfg)
+    copies: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    enrich: EnrichingProcessor = EnrichingProcessor("eu-south-1")
+    sdk.tracerProvider.addProcessor(enrich)
+    sdk.tracerProvider.addProcessor(OtelBatchSpanProcessor.fromConfig(TeeExporter(OtelOtlpSpanExporter(cfg), copies), cfg))
+
+    service: CheckoutService = CheckoutService(downstream.url)
+    incoming: dict[str, str] = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "baggage": "tenant=acme"}
+    r1: Response = service.handle(incoming)
+    first: OtelSpan = service.lastServerSpan
+    firstClient: OtelSpan = service.lastClientSpan
+    r2: Response = service.handle({})
+    second: OtelSpan = service.lastServerSpan
+    r3: Response = service.handle({"baggage": "tenant=acme"})
+    print("responses", r1.status, r2.status, r3.status)
+
+    forwarded: str = downstream.header(0, "traceparent")
+    print("downstream calls", downstream.count(), "traceparent forwarded", forwarded.startsWith("00-4bf92f3577b34da6a3ce929d0e0e4736-"), "baggage", downstream.header(0, "baggage"), downstream.header(2, "baggage") == "tenant=acme")
+    print("downstream parent is client span", forwarded.contains(firstClient.spanId))
+    print("continued trace", first.traceId == "4bf92f3577b34da6a3ce929d0e0e4736", "remote parent", first.parentSpanId)
+    print("fresh trace for request without headers", second.traceId != first.traceId and second.parentSpanId == "")
+    print("custom processor started", enrich.started, "ended", enrich.ended, "enriched", first.getAttribute("cloud.region") == "eu-south-1")
+
+    ok: Result[int] = traced[int](service.tracer, "compute", answer)
+    bad: Result[int] = traced[int](service.tracer, "compute.bad", broken)
+
+    _ = sdk.tracerProvider.forceFlush()
+    print("tee copies", copies.count(), "spans")
+    traceIdx: int = collector.lastIndexFor("/v1/traces")
+    doc: json = collector.bodyJson(traceIdx)
+    print("collector traces requests >= 1", collector.countPath("/v1/traces") >= 1, "spans", len(doc.resourceSpans[0].scopeSpans[0].spans))
+    errors: int = 0
+    failingMessage: str = ""
+    hasException: bool = false
+    spans: json = doc.resourceSpans[0].scopeSpans[0].spans
+    i: int = 0
+    while i < len(spans) {
+        code: int = spans[i].status.code
+        if code == 2 {
+            errors += 1
+            kind: int = spans[i].kind
+            if kind == 3 {
+                failingMessage = spans[i].status.message
+                hasException = len(spans[i].events) == 1
+            }
+        }
+        i += 1
+    }
+    print("server spans", countKind(doc, 2), "client spans", countKind(doc, 3), "internal", countKind(doc, 1), "error spans", errors)
+    print("failing span status message", failingMessage)
+    print("exception event on client span", hasException)
+
+    print("generic traced value", ok.unwrap(), "err", bad.error.kind)
+    down: Result[bool] = sdk.shutdown()
+
+    m: json = collector.bodyJson(collector.lastIndexFor("/v1/metrics"))
+    metrics: json = m.resourceMetrics[0].scopeMetrics[0].metrics
+    ok200: str = "?"
+    bad502: str = "?"
+    histCount: str = "?"
+    active: str = "?"
+    j: int = 0
+    while j < len(metrics) {
+        name: str = metrics[j].name
+        if name == "http.server.requests" {
+            points: json = metrics[j].sum.dataPoints
+            p: int = 0
+            while p < len(points) {
+                status: str = points[p].attributes[0].value.intValue
+                value: str = points[p].asInt
+                if status == "200" {
+                    ok200 = value
+                } else {
+                    bad502 = value
+                }
+                p += 1
+            }
+        } elif name == "http.server.duration" {
+            histCount = metrics[j].histogram.dataPoints[0].count
+            total: int = int(histCount)
+            if len(metrics[j].histogram.dataPoints) == 2 {
+                secondCount: str = metrics[j].histogram.dataPoints[1].count
+                total = total + int(secondCount)
+            }
+            histCount = str(total)
+        } elif name == "http.server.active_requests" {
+            active = metrics[j].sum.dataPoints[0].asInt
+        }
+        j += 1
+    }
+    print("metrics requests 200=" + ok200, "502=" + bad502, "histogram count", histCount, "active", active)
+
+    l: json = collector.bodyJson(collector.lastIndexFor("/v1/logs"))
+    records: json = l.resourceLogs[0].scopeLogs[0].logRecords
+    correlated: bool = true
+    errorSeverity: int = 0
+    k: int = 0
+    while k < len(records) {
+        tid: str = records[k].traceId ?? ""
+        if len(tid) != 32 {
+            correlated = false
+        }
+        sev: int = records[k].severityNumber
+        if sev > errorSeverity {
+            errorSeverity = sev
+        }
+        k += 1
+    }
+    print("logs", len(records), "correlated", correlated, "error log severity", errorSeverity)
+    print("shutdown ok", down.ok())
+    collector.close()
+    downstream.close()
+}

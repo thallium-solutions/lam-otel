@@ -1,0 +1,15 @@
+[library]
+name = "@lam/otel"
+version = "1.0.0"
+description = "OpenTelemetry tracing, metrics and logs over OTLP/HTTP JSON for Lammergeier"
+license = "Apache-2.0"
+authors = ["Lammergeier contributors"]
+repository = "https://github.com/thallium-solutions/lam-otel"
+homepage = "https://github.com/thallium-solutions/lam-otel"
+
+[compatibility]
+lamc = ">=2.1, <4"
+
+[scripts]
+test = "python3 tests/run_lamotel_tests.py --verbose"
+format = "lamc fmt ."

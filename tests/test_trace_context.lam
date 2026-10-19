@@ -1,0 +1,90 @@
+# W3C Trace Context: traceparent parsing rules, extraction, injection and
+# tracestate handling.
+#
+# expect: valid true remote true sampled true
+# expect: 4bf92f3577b34da6a3ce929d0e0e4736 00f067aa0ba902b7 1
+# expect: unsampled false
+# expect: invalid version-ff true
+# expect: invalid zero-trace true
+# expect: invalid zero-span true
+# expect: invalid uppercase true
+# expect: invalid short true
+# expect: invalid v00-trailing true
+# expect: future-version true
+# expect: future-version-bad-separator true
+# expect: invalid bad-flags true
+# expect: extract case-insensitive true
+# expect: tracestate rojo=00f067aa0ba902b7,congo=t61rcWkgMzE
+# expect: sanitized a=1,b=2
+# expect: dropped invalid tracestate true
+# expect: inject 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 rojo=1
+# expect: inject replaces Traceparent false
+# expect: invalid context injects nothing 0
+# expect: get congo=t61rcWkgMzE
+# expect: set x=9,rojo=00f067aa0ba902b7,congo=t61rcWkgMzE
+# expect: update congo=new,rojo=00f067aa0ba902b7
+# expect: delete rojo=00f067aa0ba902b7
+# expect: set invalid key unchanged true
+# expect: 32 members kept 32
+# expect: kinds server 2 consumer internal 3
+# expect: status error 2 ok
+
+from @lam/otel import OtelTraceContext, OtelSpanContext, OtelSpanKind, OtelStatusCode
+from lamstrings import Strings
+
+func invalid(label: str, value: str) {
+    ctx: OtelSpanContext = OtelTraceContext.parseTraceparent(value)
+    print("invalid", label, not ctx.isValid())
+}
+
+func main() {
+    tp: str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    ctx: OtelSpanContext = OtelTraceContext.parseTraceparent(tp)
+    print("valid", ctx.isValid(), "remote", ctx.isRemote(), "sampled", ctx.isSampled())
+    print(ctx.traceId, ctx.spanId, ctx.traceFlags)
+    unsampled: OtelSpanContext = OtelTraceContext.parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+    print("unsampled", unsampled.isSampled())
+
+    invalid("version-ff", "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+    invalid("zero-trace", "00-00000000000000000000000000000000-00f067aa0ba902b7-01")
+    invalid("zero-span", "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01")
+    invalid("uppercase", "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01")
+    invalid("short", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1")
+    invalid("v00-trailing", tp + "-extra")
+    future: OtelSpanContext = OtelTraceContext.parseTraceparent("cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-the-future-holds")
+    print("future-version", future.isValid())
+    futureBad: OtelSpanContext = OtelTraceContext.parseTraceparent("cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01x")
+    print("future-version-bad-separator", not futureBad.isValid())
+    invalid("bad-flags", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g")
+
+    headers: dict[str, str] = {"TRACEPARENT": tp, "TraceState": " rojo=00f067aa0ba902b7 , congo=t61rcWkgMzE ,,"}
+    extracted: OtelSpanContext = OtelTraceContext.extract(headers)
+    print("extract case-insensitive", extracted.isValid() and extracted.remote)
+    print("tracestate", extracted.traceState)
+    print("sanitized", OtelTraceContext.sanitizeTraceState("a=1,BAD=x,b=2,a=3,novalue,c=x=y"))
+    bad: dict[str, str] = {"traceparent": tp, "tracestate": "Invalid Key=1"}
+    print("dropped invalid tracestate", OtelTraceContext.extract(bad).traceState == "")
+
+    out: dict[str, str] = {"Traceparent": "stale"}
+    OtelTraceContext.inject(OtelSpanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 1, "rojo=1"), out)
+    print("inject", out["traceparent"], out["tracestate"])
+    print("inject replaces Traceparent", "Traceparent" in out)
+    empty: dict[str, str] = {}
+    OtelTraceContext.inject(OtelSpanContext.invalid(), empty)
+    print("invalid context injects nothing", len(empty))
+
+    state: str = "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE"
+    print("get", "congo=" + OtelTraceContext.traceStateGet(state, "congo"))
+    print("set", OtelTraceContext.traceStateSet(state, "x", "9"))
+    print("update", OtelTraceContext.traceStateSet(state, "congo", "new"))
+    print("delete", OtelTraceContext.traceStateDelete(state, "congo"))
+    print("set invalid key unchanged", OtelTraceContext.traceStateSet(state, "Bad Key", "1") == state)
+    members: list[str] = []
+    for i in range(40) {
+        members.append("k" + str(i) + "=v")
+    }
+    print("32 members kept", len(OtelTraceContext.sanitizeTraceState(Strings.join(members, ",")).split(",")))
+
+    print("kinds", OtelSpanKind.name(OtelSpanKind.SERVER), OtelSpanKind.parse("SPAN_KIND_SERVER"), OtelSpanKind.name(OtelSpanKind.CONSUMER), OtelSpanKind.name(99), OtelSpanKind.parse("client"))
+    print("status", OtelStatusCode.name(OtelStatusCode.ERROR), OtelStatusCode.parse("Error"), OtelStatusCode.name(1))
+}

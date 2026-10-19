@@ -1,0 +1,108 @@
+# OTLP transport behaviour against an ephemeral local collector: retries
+# with backoff on 429/5xx, Retry-After, non-retryable statuses, exhausted
+# retries, transport failures, timeouts, gzip compression, partial success
+# and the shutdown state of exporters.
+#
+# expect: retried ok true attempts 3 requests 3
+# expect: retryable 429 true 500 true 502 true 503 true 504 true 400 false 404 false
+# expect: backoff 100 200 400 800 800 retry-after 2000 capped 800
+# expect: non-retryable kind OtelExportError attempts 1 status 400
+# expect: message has status true
+# expect: exhausted requests 2 after 2 attempts true
+# expect: retry-after waited true
+# expect: transport kind OtelExportError transport true
+# expect: timeout kind OtelExportError
+# expect: gzip header gzip body decoded true
+# expect: partial rejected 3 message too many attributes partial true
+# expect: config missing kind OtelConfigError
+# expect: shutdown exporter kind OtelShutdownError
+# expect: empty batch sends nothing 0 requests 0
+
+from @lam/otel import OtelConfig, OtelOtlpHttp, OtelOtlpSpanExporter, OtelExportResult, OtelSpan
+from otelmock import OtelMockCollector
+from lamerrors import Result, Error
+from lamtime import Time
+
+func config(url: str) -> OtelConfig {
+    cfg: OtelConfig = OtelConfig("retry-test", url, "", 2000)
+    cfg.retryInitialBackoffMs = 10
+    cfg.retryMaxBackoffMs = 40
+    return cfg
+}
+
+func spans() -> list[OtelSpan] {
+    s: OtelSpan = OtelSpan("op")
+    s.end()
+    return [s]
+}
+
+func main() {
+    flaky: OtelMockCollector = OtelMockCollector([503, 429])
+    ok: Result[OtelExportResult] = OtelOtlpSpanExporter(config(flaky.url)).export(spans())
+    print("retried ok", ok.ok(), "attempts", ok.unwrap().attempts, "requests", flaky.count())
+    flaky.close()
+
+    print("retryable 429", OtelOtlpHttp.retryable(429), "500", OtelOtlpHttp.retryable(500), "502", OtelOtlpHttp.retryable(502), "503", OtelOtlpHttp.retryable(503), "504", OtelOtlpHttp.retryable(504), "400", OtelOtlpHttp.retryable(400), "404", OtelOtlpHttp.retryable(404))
+    t: OtelOtlpHttp = OtelOtlpHttp("http://unused", {}, 1000, "none", 5, 100, 800)
+    print("backoff", t.backoffMs(1), t.backoffMs(2), t.backoffMs(3), t.backoffMs(4), t.backoffMs(9), "retry-after", OtelOtlpHttp("http://unused", {}, 1000, "none", 5, 100, 5000).backoffMs(1, "2"), "capped", t.backoffMs(1, "30"))
+
+    rejecting: OtelMockCollector = OtelMockCollector([400])
+    bad: Result[OtelExportResult] = OtelOtlpSpanExporter(config(rejecting.url)).export(spans())
+    badResult: OtelExportResult = bad.error.cause
+    print("non-retryable kind", bad.error.kind, "attempts", badResult.attempts, "status", badResult.status)
+    print("message has status", bad.error.message.contains("status 400"))
+    rejecting.close()
+
+    down: OtelMockCollector = OtelMockCollector([503, 503, 503])
+    cfg: OtelConfig = config(down.url)
+    cfg.retryMaxAttempts = 2
+    exhausted: Result[OtelExportResult] = OtelOtlpSpanExporter(cfg).export(spans())
+    print("exhausted requests", down.count(), "after 2 attempts", exhausted.error.message.contains("after 2 attempts"))
+    down.close()
+
+    throttled: OtelMockCollector = OtelMockCollector([429], "1")
+    tcfg: OtelConfig = config(throttled.url)
+    tcfg.retryMaxBackoffMs = 2000
+    started: int = Time.nowUnixMilli()
+    OtelOtlpSpanExporter(tcfg).export(spans())
+    print("retry-after waited", Time.nowUnixMilli() - started >= 900)
+    throttled.close()
+
+    nowhere: OtelConfig = config(OtelMockCollector.unusedUrl())
+    nowhere.retryMaxAttempts = 2
+    refused: Result[OtelExportResult] = OtelOtlpSpanExporter(nowhere).export(spans())
+    print("transport kind", refused.error.kind, "transport", refused.error.message.contains("transport failed"))
+
+    slow: OtelMockCollector = OtelMockCollector([], "", 600)
+    scfg: OtelConfig = config(slow.url)
+    scfg.timeoutMs = 100
+    scfg.retryMaxAttempts = 1
+    timedOut: Result[OtelExportResult] = OtelOtlpSpanExporter(scfg).export(spans())
+    print("timeout kind", timedOut.error.kind)
+    slow.close()
+
+    zipped: OtelMockCollector = OtelMockCollector()
+    zcfg: OtelConfig = config(zipped.url)
+    zcfg.compression = "gzip"
+    OtelOtlpSpanExporter(zcfg).export(spans())
+    print("gzip header", zipped.header(0, "Content-Encoding"), "body decoded", zipped.body(0).contains("resourceSpans"))
+    zipped.close()
+
+    partial: OtelMockCollector = OtelMockCollector([], "", 0, "{\"partialSuccess\":{\"rejectedSpans\":\"3\",\"errorMessage\":\"too many attributes\"}}")
+    pr: OtelExportResult = OtelOtlpSpanExporter(config(partial.url)).export(spans()).unwrap()
+    print("partial rejected", pr.rejected, "message", pr.errorMessage, "partial", pr.partial())
+    partial.close()
+
+    missing: Result[OtelExportResult] = OtelOtlpSpanExporter(OtelConfig("x", "")).export(spans())
+    print("config missing kind", missing.error.kind)
+
+    counting: OtelMockCollector = OtelMockCollector()
+    exporter: OtelOtlpSpanExporter = OtelOtlpSpanExporter(config(counting.url))
+    exporter.shutdown()
+    stopped: Result[OtelExportResult] = exporter.export(spans())
+    print("shutdown exporter kind", stopped.error.kind)
+    empty: list[OtelSpan] = []
+    live: OtelOtlpSpanExporter = OtelOtlpSpanExporter(config(counting.url))
+    print("empty batch sends nothing", live.export(empty).unwrap().attempts, "requests", counting.count())
+    counting.close()
+}

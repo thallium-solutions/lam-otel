@@ -1,0 +1,117 @@
+# Samplers: always on/off, trace-id ratio (deterministic, roughly
+# proportional), parent-based delegation, custom samplers, configuration
+# names, and how decisions shape recording/export through a provider.
+#
+# expect: always_on 2 always_off 0
+# expect: ratio 0 drops true ratio 1 samples true
+# expect: ratio deterministic true
+# expect: ratio 0.25 within 0.18..0.32 true
+# expect: ratio clamps 1 0
+# expect: parent remote sampled 2 remote unsampled 0
+# expect: parent local sampled 2 local unsampled 0
+# expect: parent root uses root 0
+# expect: parent delegate override 2
+# expect: custom 1 0
+# expect: config AlwaysOnSampler AlwaysOffSampler TraceIdRatioBased{0.5}
+# expect: config ParentBased{root=AlwaysOnSampler} ParentBased{root=AlwaysOffSampler} ParentBased{root=TraceIdRatioBased{0.1}}
+# expect: unknown name ParentBased{root=AlwaysOnSampler} bad arg TraceIdRatioBased{1}
+# expect: dropped span recording false sampled false valid-context true
+# expect: dropped span ignores attributes true
+# expect: record-only recording true sampled false
+# expect: exported names [kept]
+# expect: child of unsampled remote parent dropped false same trace true
+# expect: child of sampled remote parent sampled true parent 00f067aa0ba902b7
+# expect: noop provider recording false traceparent-propagates true
+
+from @lam/otel import OtelSampler, OtelSamplingDecision, OtelSpanContext, OtelSpanKind, OtelTracerProvider, OtelTracer, OtelSpan, OtelInMemorySpanExporter, OtelSimpleSpanProcessor, OtelTraceContext, OtelUtil, Otel
+
+func decide(s: OtelSampler, parent: OtelSpanContext, traceId: str) -> int {
+    return s.shouldSample(parent, traceId, "op", OtelSpanKind.INTERNAL, {})
+}
+
+func onlyKept(parent: OtelSpanContext, traceId: str, name: str, kind: int, attributes: dict[str, any]) -> int {
+    _ = parent
+    _ = traceId
+    _ = kind
+    if name == "kept" {
+        return OtelSamplingDecision.RECORD_AND_SAMPLE
+    }
+    if "record" in attributes {
+        return OtelSamplingDecision.RECORD_ONLY
+    }
+    return OtelSamplingDecision.DROP
+}
+
+func main() {
+    none: OtelSpanContext = OtelSpanContext.invalid()
+    tid: str = "4bf92f3577b34da6a3ce929d0e0e4736"
+    print("always_on", decide(OtelSampler.alwaysOn(), none, tid), "always_off", decide(OtelSampler.alwaysOff(), none, tid))
+    print("ratio 0 drops", decide(OtelSampler.traceIdRatio(0.0), none, tid) == 0, "ratio 1 samples", decide(OtelSampler.traceIdRatio(1.0), none, tid) == 2)
+
+    half: OtelSampler = OtelSampler.traceIdRatio(0.5)
+    stable: bool = true
+    for i in range(20) {
+        id: str = OtelUtil.traceId()
+        if decide(half, none, id) != decide(half, none, id) {
+            stable = false
+        }
+    }
+    print("ratio deterministic", stable)
+    quarter: OtelSampler = OtelSampler.traceIdRatio(0.25)
+    sampled: int = 0
+    for i in range(4000) {
+        if decide(quarter, none, OtelUtil.traceId()) == 2 {
+            sampled += 1
+        }
+    }
+    print("ratio 0.25 within 0.18..0.32", sampled > 720 and sampled < 1280)
+    print("ratio clamps", OtelSampler.traceIdRatio(7.0).ratio, OtelSampler.traceIdRatio(-1.0).ratio)
+
+    pb: OtelSampler = OtelSampler.parentBased(OtelSampler.alwaysOff())
+    remoteSampled: OtelSpanContext = OtelSpanContext(tid, "00f067aa0ba902b7", 1, "", true)
+    remoteUnsampled: OtelSpanContext = OtelSpanContext(tid, "00f067aa0ba902b7", 0, "", true)
+    localSampled: OtelSpanContext = OtelSpanContext(tid, "00f067aa0ba902b7", 1, "", false)
+    localUnsampled: OtelSpanContext = OtelSpanContext(tid, "00f067aa0ba902b7", 0, "", false)
+    print("parent remote sampled", decide(pb, remoteSampled, tid), "remote unsampled", decide(pb, remoteUnsampled, tid))
+    print("parent local sampled", decide(pb, localSampled, tid), "local unsampled", decide(pb, localUnsampled, tid))
+    print("parent root uses root", decide(pb, none, tid))
+    pb.remoteParentNotSampled = OtelSampler.alwaysOn()
+    print("parent delegate override", decide(pb, remoteUnsampled, tid))
+
+    custom: OtelSampler = OtelSampler.custom("OnlyKept", onlyKept)
+    print("custom", custom.shouldSample(none, tid, "x", 1, {"record": true}), custom.shouldSample(none, tid, "x", 1, {}))
+
+    print("config", OtelSampler.fromConfig("always_on").description(), OtelSampler.fromConfig("ALWAYS_OFF").description(), OtelSampler.fromConfig("traceidratio", "0.5").description())
+    print("config", OtelSampler.fromConfig("parentbased_always_on").description(), OtelSampler.fromConfig("parentbased_always_off").description(), OtelSampler.fromConfig("parentbased_traceidratio", "0.1").description())
+    print("unknown name", OtelSampler.fromConfig("jaeger_remote").description(), "bad arg", OtelSampler.fromConfig("traceidratio", "half").description())
+
+    mem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    provider: OtelTracerProvider = OtelTracerProvider(None, custom)
+    provider.addProcessor(OtelSimpleSpanProcessor(mem))
+    tracer: OtelTracer = provider.tracer("sampling")
+    dropped: OtelSpan = tracer.startSpan("dropped")
+    print("dropped span recording", dropped.isRecording(), "sampled", dropped.isSampled(), "valid-context", dropped.spanContext().isValid())
+    dropped.setAttribute("k", "v")
+    print("dropped span ignores attributes", dropped.getAttribute("k") == None)
+    dropped.end()
+    recordOnly: OtelSpan = tracer.startSpan("record-only", attributes={"record": true})
+    print("record-only recording", recordOnly.isRecording(), "sampled", recordOnly.isSampled())
+    recordOnly.end()
+    kept: OtelSpan = tracer.startSpan("kept")
+    kept.end()
+    print("exported names", mem.names())
+
+    pbProvider: OtelTracerProvider = OtelTracerProvider()
+    pbProvider.addProcessor(OtelSimpleSpanProcessor(mem))
+    pbTracer: OtelTracer = pbProvider.tracer()
+    child: OtelSpan = pbTracer.startSpan("child", parent=remoteUnsampled)
+    print("child of unsampled remote parent dropped", child.isRecording(), "same trace", child.traceId == tid)
+    child2: OtelSpan = pbTracer.startSpanFromHeaders("child2", {"traceparent": "00-" + tid + "-00f067aa0ba902b7-01"})
+    print("child of sampled remote parent sampled", child2.isSampled(), "parent", child2.parentSpanId)
+
+    noopTracer: OtelTracer = Otel.tracer("unconfigured")
+    ghost: OtelSpan = noopTracer.startSpan("ghost", parent=remoteSampled)
+    headers: dict[str, str] = {}
+    ghost.inject(headers)
+    print("noop provider recording", ghost.isRecording(), "traceparent-propagates", headers["traceparent"].contains(tid))
+}

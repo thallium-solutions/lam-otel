@@ -1,0 +1,88 @@
+# Console exporters for spans, metrics and logs (captured through the
+# ``out`` callback, plus one real write to standard output), and the
+# exporter selection of the providers' fromConfig (OTEL_*_EXPORTER).
+#
+# expect: span lines 2 first has name true resource true scope true
+# expect: span line is json true kind 2
+# expect: metric lines 1 has sum true scope console.meter
+# expect: log lines 1 severity WARN body careful
+# expect: stdout line follows
+# expect: {"logRecord":{"attributes":[],"body":{"stringValue":"to stdout"},"droppedAttributesCount":0,"flags":0,"observedTimeUnixNano":"5","severityNumber":9,"severityText":"INFO","timeUnixNano":"5"},"scope":{"name":"console.logs","version":""}}
+# expect: shutdown refuses OtelShutdownError
+# expect: fromConfig console processors 1 none 0 otlp+console 2
+# expect: disabled provider recording false
+
+from @lam/otel import OtelConsoleSpanExporter, OtelConsoleMetricExporter, OtelConsoleLogExporter, OtelSimpleSpanProcessor, OtelSimpleLogProcessor, OtelTracerProvider, OtelTracer, OtelSpan, OtelSpanKind, OtelMeterProvider, OtelMetricReader, OtelLoggerProvider, OtelLogger, OtelLogRecord, OtelSeverity, OtelConfig, OtelExportResult
+from lamerrors import Result
+from lamjson import Json
+
+class Lines {
+    func init(self) {
+        self.items: list[str] = []
+    }
+
+    func add(self, line: str) {
+        self.items.append(line)
+    }
+}
+
+func main() {
+    spanLines: Lines = Lines()
+    tp: OtelTracerProvider = OtelTracerProvider()
+    tp.addProcessor(OtelSimpleSpanProcessor(OtelConsoleSpanExporter(spanLines.add)))
+    tracer: OtelTracer = tp.tracer("console.tracer")
+    s: OtelSpan = tracer.startSpan("render", OtelSpanKind.SERVER)
+    s.end()
+    s2: OtelSpan = tracer.startSpan("second")
+    s2.end()
+    first: str = spanLines.items[0]
+    print("span lines", len(spanLines.items), "first has name", first.contains("\"name\":\"render\""), "resource", first.contains("telemetry.sdk.name"), "scope", first.contains("console.tracer"))
+    doc: json = Json.decode(first).unwrap()
+    kind: int = doc.span.kind
+    print("span line is json", Json.kind(doc) == "object", "kind", kind)
+
+    metricLines: Lines = Lines()
+    mp: OtelMeterProvider = OtelMeterProvider()
+    reader: OtelMetricReader = OtelMetricReader(OtelConsoleMetricExporter(metricLines.add), 0)
+    mp.addReader(reader)
+    mp.meter("console.meter").counter("hits").add(3)
+    _ = reader.forceFlush()
+    print("metric lines", len(metricLines.items), "has sum", metricLines.items[0].contains("\"sum\""), "scope", "console.meter" if metricLines.items[0].contains("console.meter") else "missing")
+
+    logLines: Lines = Lines()
+    lp: OtelLoggerProvider = OtelLoggerProvider()
+    lp.addProcessor(OtelSimpleLogProcessor(OtelConsoleLogExporter(logLines.add)))
+    lp.logger("console.logs").warn("careful")
+    ldoc: json = Json.decode(logLines.items[0]).unwrap()
+    sev: str = ldoc.logRecord.severityText
+    body: str = ldoc.logRecord.body.stringValue
+    print("log lines", len(logLines.items), "severity", sev, "body", body)
+
+    print("stdout line follows")
+    stdout: OtelConsoleLogExporter = OtelConsoleLogExporter()
+    rec: OtelLogRecord = OtelLogRecord("to stdout", OtelSeverity.INFO)
+    rec.timeUnixNano = 5
+    rec.observedTimeUnixNano = 5
+    rec.scopeName = "console.logs"
+    rec.scopeVersion = ""
+    records: list[OtelLogRecord] = [rec]
+    _ = stdout.export(records)
+    _ = stdout.shutdown()
+    refused: Result[OtelExportResult] = stdout.export(records)
+    print("shutdown refuses", refused.error.kind)
+
+    console: OtelConfig = OtelConfig("svc", "")
+    console.tracesExporter = "console"
+    none: OtelConfig = OtelConfig("svc", "")
+    none.tracesExporter = "none"
+    both: OtelConfig = OtelConfig("svc", "http://127.0.0.1:9")
+    both.tracesExporter = "otlp,console"
+    bothProvider: OtelTracerProvider = OtelTracerProvider.fromConfig(both)
+    print("fromConfig console processors", len(OtelTracerProvider.fromConfig(console).processorList()), "none", len(OtelTracerProvider.fromConfig(none).processorList()), "otlp+console", len(bothProvider.processorList()))
+    _ = bothProvider.shutdown()
+
+    disabled: OtelConfig = OtelConfig("svc", "")
+    disabled.disabled = true
+    ghost: OtelSpan = OtelTracerProvider.fromConfig(disabled).tracer().startSpan("ghost")
+    print("disabled provider recording", ghost.isRecording())
+}

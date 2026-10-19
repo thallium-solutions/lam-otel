@@ -1,0 +1,199 @@
+# Span processors: simple and batch processors (full batch wakes the
+# worker, periodic flush, queue overflow, forceFlush, shutdown, export
+# timeout), custom processors through the interface, provider lifecycle.
+#
+# expect: simple exported 1 unsampled skipped true
+# expect: custom onStart 2 onEnd 2 attribute-from-onStart true
+# expect: batch queued before flush 3 exported 0
+# expect: forceFlush ok true exported 3 calls 1
+# expect: full batch wakes worker true export calls >= 2 true
+# expect: periodic flush exported 2
+# expect: overflow queued 5 dropped 3
+# expect: shutdown exports queue true total 5
+# expect: shutdown idempotent true exporter stopped true
+# expect: after shutdown queue refuses 0
+# expect: slow exporter timeout failed 1 error OtelTimeoutError
+# expect: failing exporter failed 2 lastError Boom: collector down
+# expect: provider shutdown ok true later spans recording false
+# expect: provider forceFlush ok true
+# expect: provider tracer cached true distinct true
+# expect: panicking exporter contained failed 1 panicked true
+
+from @lam/otel import OtelTracerProvider, OtelTracer, OtelSpan, OtelSampler, OtelInMemorySpanExporter, OtelSimpleSpanProcessor, OtelBatchSpanProcessor, OtelExportResult, OtelSpanContext
+from lamerrors import Result, Error
+from lamtime import Time
+
+class CountingProcessor {
+    func init(self) {
+        self.started: int = 0
+        self.ended: int = 0
+    }
+
+    func onStart(self, span: OtelSpan) {
+        self.started += 1
+        span.setAttribute("enriched", true)
+    }
+
+    func onEnd(self, span: OtelSpan) {
+        _ = span
+        self.ended += 1
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+class SlowExporter {
+    func init(self, delayMs: int) {
+        self.delayMs: int = delayMs
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        Time.sleepMs(self.delayMs)
+        return Result.Ok(OtelExportResult(200, "", 1, len(spans)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+class FailingExporter {
+    func init(self) {
+        self.calls: int = 0
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        _ = spans
+        self.calls += 1
+        return Result.Err(Error("Boom", "collector down"))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+class PanickingExporter {
+    func init(self) {
+        self.calls: int = 0
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        _ = spans
+        self.calls += 1
+        throw ValueError("exporter bug")
+    }
+
+    func shutdown(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+func spans(tracer: OtelTracer, n: int) {
+    for i in range(n) {
+        s: OtelSpan = tracer.startSpan("s" + str(i))
+        s.end()
+    }
+}
+
+func main() {
+    mem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    simple: OtelTracerProvider = OtelTracerProvider()
+    simple.addProcessor(OtelSimpleSpanProcessor(mem))
+    counting: CountingProcessor = CountingProcessor()
+    simple.addProcessor(counting)
+    t: OtelTracer = simple.tracer("simple")
+    a: OtelSpan = t.startSpan("a")
+    a.end()
+    unsampled: OtelSpan = t.startSpan("b", parent=OtelSpanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 1, "", false))
+    unsampled.traceFlags = 0
+    unsampled.end()
+    print("simple exported", mem.count(), "unsampled skipped", mem.find("b") == None)
+    print("custom onStart", counting.started, "onEnd", counting.ended, "attribute-from-onStart", a.getAttribute("enriched") == true)
+
+    batchMem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    batch: OtelBatchSpanProcessor = OtelBatchSpanProcessor(batchMem, 100, 60000, 50, 5000)
+    bp: OtelTracerProvider = OtelTracerProvider()
+    bp.addProcessor(batch)
+    bt: OtelTracer = bp.tracer("batch")
+    spans(bt, 3)
+    print("batch queued before flush", batch.queued(), "exported", batchMem.count())
+    flushed: Result[bool] = batch.forceFlush()
+    print("forceFlush ok", flushed.ok(), "exported", batch.exported(), "calls", batchMem.exportCalls)
+
+    wakeMem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    wake: OtelBatchSpanProcessor = OtelBatchSpanProcessor(wakeMem, 100, 60000, 4, 5000)
+    wp: OtelTracerProvider = OtelTracerProvider()
+    wp.addProcessor(wake)
+    spans(wp.tracer(), 8)
+    waited: int = 0
+    while wakeMem.count() < 8 and waited < 3000 {
+        Time.sleepMs(10)
+        waited += 10
+    }
+    # The worker drains whatever is queued when it wakes, in batches of at
+    # most 4 spans, so 8 spans need at least two export calls.
+    print("full batch wakes worker", wakeMem.count() == 8, "export calls >= 2", wakeMem.exportCalls >= 2)
+
+    tickMem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    tick: OtelBatchSpanProcessor = OtelBatchSpanProcessor(tickMem, 100, 50, 50, 5000)
+    tp: OtelTracerProvider = OtelTracerProvider()
+    tp.addProcessor(tick)
+    spans(tp.tracer(), 2)
+    waited = 0
+    while tickMem.count() < 2 and waited < 3000 {
+        Time.sleepMs(10)
+        waited += 10
+    }
+    print("periodic flush exported", tickMem.count())
+
+    overMem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    over: OtelBatchSpanProcessor = OtelBatchSpanProcessor(overMem, 5, 60000, 5000, 5000)
+    op: OtelTracerProvider = OtelTracerProvider()
+    op.addProcessor(over)
+    spans(op.tracer(), 8)
+    print("overflow queued", over.queued(), "dropped", over.dropped())
+    closed: Result[bool] = op.shutdown()
+    print("shutdown exports queue", closed.ok(), "total", overMem.count())
+    again: Result[bool] = over.shutdown()
+    print("shutdown idempotent", again.ok(), "exporter stopped", overMem.stopped)
+    late: OtelSpan = OtelSpan("late")
+    over.onEnd(late)
+    print("after shutdown queue refuses", over.queued())
+
+    slow: OtelBatchSpanProcessor = OtelBatchSpanProcessor(SlowExporter(500), 10, 60000, 10, 50)
+    sp: OtelTracerProvider = OtelTracerProvider()
+    sp.addProcessor(slow)
+    spans(sp.tracer(), 1)
+    timedOut: Result[bool] = slow.forceFlush()
+    print("slow exporter timeout failed", slow.failed(), "error", timedOut.error.kind)
+
+    failing: FailingExporter = FailingExporter()
+    fp: OtelBatchSpanProcessor = OtelBatchSpanProcessor(failing, 10, 60000, 10, 1000)
+    fprov: OtelTracerProvider = OtelTracerProvider()
+    fprov.addProcessor(fp)
+    spans(fprov.tracer(), 2)
+    fp.forceFlush()
+    print("failing exporter failed", fp.failed(), "lastError", fp.lastError())
+
+    down: Result[bool] = bp.shutdown()
+    after: OtelSpan = bt.startSpan("after")
+    print("provider shutdown ok", down.ok(), "later spans recording", after.isRecording())
+    print("provider forceFlush ok", wp.forceFlush().ok())
+    print("provider tracer cached", wp.tracer("x", "1") == wp.tracer("x", "1"), "distinct", wp.tracer("x", "1") != wp.tracer("x", "2"))
+    panicky: OtelSimpleSpanProcessor = OtelSimpleSpanProcessor(PanickingExporter())
+    pp: OtelTracerProvider = OtelTracerProvider()
+    pp.addProcessor(panicky)
+    spans(pp.tracer(), 1)
+    print("panicking exporter contained failed", panicky.failedCount, "panicked", panicky.lastError.contains("panicked"))
+    wp.shutdown()
+    tp.shutdown()
+    sp.shutdown()
+    fprov.shutdown()
+}

@@ -1,0 +1,88 @@
+# The Otel facade end to end: Otel.setup() from the environment installs
+# tracer, meter and logger providers plus the propagator globally; spans,
+# metrics and logs reach the collector on Otel.shutdown().
+#
+# expect: before setup recording false
+# expect: setup service facade-svc sampler ParentBased{root=AlwaysOnSampler}
+# expect: global tracer recording true same provider true
+# expect: propagator fields [traceparent tracestate]
+# expect: injected traceparent only true false
+# expect: shutdown ok true
+# expect: traces 1 metrics 1 logs 1
+# expect: trace span facade.op service facade-svc
+# expect: metric facade.calls asInt 2
+# expect: log body done trace-correlated true
+# expect: header x-api-key k1 on all true
+# expect: after shutdown recording false
+
+from @lam/otel import Otel, OtelSdk, OtelTracer, OtelSpan, OtelSpanKind, OtelBaggage, OtelLogger
+from otelmock import OtelMockCollector
+from lamenv import Env
+from lamerrors import Result
+
+func main() {
+    before: OtelSpan = Otel.tracer("early").startSpan("early")
+    print("before setup recording", before.isRecording())
+
+    mock: OtelMockCollector = OtelMockCollector()
+    _ = Env.set("OTEL_SERVICE_NAME", "facade-svc")
+    _ = Env.set("OTEL_EXPORTER_OTLP_ENDPOINT", mock.url)
+    _ = Env.set("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=k1")
+    _ = Env.set("OTEL_PROPAGATORS", "tracecontext")
+    _ = Env.set("OTEL_METRIC_EXPORT_INTERVAL", "600000")
+    _ = Env.set("OTEL_BSP_SCHEDULE_DELAY", "600000")
+    _ = Env.set("OTEL_BLRP_SCHEDULE_DELAY", "600000")
+    sdk: OtelSdk = Otel.setup()
+    print("setup service", sdk.config.serviceName, "sampler", sdk.tracerProvider.sampler.description())
+
+    tracer: OtelTracer = Otel.tracer("facade", "1.0.0")
+    span: OtelSpan = tracer.startSpan("facade.op", OtelSpanKind.INTERNAL)
+    print("global tracer recording", span.isRecording(), "same provider", tracer.provider == sdk.tracerProvider)
+    print("propagator fields", Otel.propagator().fields())
+    headers: dict[str, str] = {}
+    bag: OtelBaggage = OtelBaggage()
+    bag.set("tenant", "t1")
+    Otel.inject(headers, span.spanContext(), bag)
+    print("injected traceparent only", "traceparent" in headers, "baggage" in headers)
+
+    Otel.meter("facade").counter("facade.calls").add(2)
+    logger: OtelLogger = Otel.logger("facade")
+    logger.info("done", {}, span.spanContext())
+    span.end()
+
+    down: Result[bool] = Otel.shutdown()
+    print("shutdown ok", down.ok())
+    print("traces", mock.countPath("/v1/traces"), "metrics", mock.countPath("/v1/metrics"), "logs", mock.countPath("/v1/logs"))
+
+    t: json = mock.bodyJson(mock.lastIndexFor("/v1/traces"))
+    spanName: str = t.resourceSpans[0].scopeSpans[0].spans[0].name
+    service: str = ""
+    attrs: json = t.resourceSpans[0].resource.attributes
+    i: int = 0
+    while i < len(attrs) {
+        k: str = attrs[i].key
+        if k == "service.name" {
+            service = attrs[i].value.stringValue
+        }
+        i += 1
+    }
+    print("trace span", spanName, "service", service)
+    m: json = mock.bodyJson(mock.lastIndexFor("/v1/metrics"))
+    metricName: str = m.resourceMetrics[0].scopeMetrics[0].metrics[0].name
+    value: str = m.resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0].asInt
+    print("metric", metricName, "asInt", value)
+    l: json = mock.bodyJson(mock.lastIndexFor("/v1/logs"))
+    body: str = l.resourceLogs[0].scopeLogs[0].logRecords[0].body.stringValue
+    traceId: str = l.resourceLogs[0].scopeLogs[0].logRecords[0].traceId
+    print("log body", body, "trace-correlated", traceId == span.traceId)
+    allHeaders: bool = true
+    for idx in range(mock.count()) {
+        if mock.header(idx, "X-Api-Key") != "k1" {
+            allHeaders = false
+        }
+    }
+    print("header x-api-key", mock.header(0, "X-Api-Key"), "on all", allHeaders)
+    after: OtelSpan = Otel.tracer("facade").startSpan("after")
+    print("after shutdown recording", after.isRecording())
+    mock.close()
+}

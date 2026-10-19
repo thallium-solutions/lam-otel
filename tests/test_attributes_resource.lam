@@ -1,0 +1,91 @@
+# IDs, OTLP/JSON AnyValue encoding, attribute limits and resources.
+#
+# expect: ids 32 16 hex true true distinct true
+# expect: legacy ids 32 16
+# expect: string {"stringValue":"hi"}
+# expect: int {"intValue":"42"}
+# expect: float {"doubleValue":2.5}
+# expect: bool {"boolValue":true}
+# expect: bytes {"bytesValue":"AAH/"}
+# expect: list {"arrayValue":{"values":[{"intValue":"1"},{"stringValue":"two"}]}}
+# expect: map {"kvlistValue":{"values":[{"key":"a","value":{"intValue":"1"}}]}}
+# expect: none {}
+# expect: sorted keyvalues a,b,c
+# expect: attributeKey order-independent true type-sensitive true
+# expect: truncate héllo [ab cd] 7
+# expect: setLimited true false true size 2 overwritten 9
+# expect: resource defaults unknown_service lammergeier @lam/otel 1.0.0
+# expect: merge other-wins api 2 kept true
+# expect: set true ignored-none false
+# expect: resource json attributes 2
+# expect: percent a%20b%2Cc%3Dd%25 -> a b,c=d% malformed %zz
+# expect: env from OTEL_SERVICE_NAME svc-env host-1
+
+from @lam/otel import OtelUtil, OtelResource, Otel
+from lamjson import Json
+from lambytes import Bytes
+from lamenv import Env
+from lamstrings import Strings
+
+func enc(v: any) -> str {
+    j: json = OtelUtil.anyValueJson(v)
+    return Json.encode(j).unwrap()
+}
+
+func main() {
+    t: str = OtelUtil.traceId()
+    s: str = OtelUtil.spanId()
+    print("ids", len(t), len(s), "hex", OtelUtil.isLowerHex(t, 32), OtelUtil.isLowerHex(s, 16), "distinct", t != OtelUtil.traceId())
+    print("legacy ids", len(Otel.idsTrace()), len(Otel.idsSpan()))
+
+    print("string", enc("hi"))
+    print("int", enc(42))
+    print("float", enc(2.5))
+    print("bool", enc(true))
+    raw: str = Bytes.hexDecode("0001ff").unwrap()
+    print("bytes", Json.encode(OtelUtil.bytesValueJson(raw)).unwrap())
+    mixed: list[any] = [1, "two"]
+    print("list", enc(mixed))
+    m: dict[str, any] = {"a": 1}
+    print("map", enc(m))
+    print("none", enc(None))
+
+    kvs: json = OtelUtil.attributesJson({"c": 1, "a": 2, "b": 3})
+    keys: list[str] = []
+    for item in Json.toList(kvs).unwrap() {
+        kv: json = Json.fromValue(item).unwrap()
+        k: str = kv.key
+        keys.append(k)
+    }
+    print("sorted keyvalues", Strings.join(keys, ","))
+    print("attributeKey order-independent", OtelUtil.attributeKey({"a": 1, "b": "x"}) == OtelUtil.attributeKey({"b": "x", "a": 1}), "type-sensitive", OtelUtil.attributeKey({"a": 1}) != OtelUtil.attributeKey({"a": "1"}))
+
+    print("truncate", OtelUtil.truncate("héllo wörld", 5), OtelUtil.truncate(["abc", "cde"], 2), OtelUtil.truncate(7, 1))
+    attrs: dict[str, any] = {}
+    r1: bool = OtelUtil.setLimited(attrs, "a", 1, 2, -1)
+    OtelUtil.setLimited(attrs, "b", 2, 2, -1)
+    r2: bool = OtelUtil.setLimited(attrs, "c", 3, 2, -1)
+    r3: bool = OtelUtil.setLimited(attrs, "a", 9, 2, -1)
+    print("setLimited", r1, r2, r3, "size", len(attrs), "overwritten", attrs["a"])
+
+    d: OtelResource = OtelResource.sdkDefaults()
+    print("resource defaults", d.serviceName(), d.getString("telemetry.sdk.language"), d.getString("telemetry.sdk.name"), d.getString("telemetry.sdk.version"))
+    a: OtelResource = OtelResource({"service.name": "web", "host.name": "h1"})
+    b: OtelResource = OtelResource({"service.name": "api", "replicas": 2})
+    merged: OtelResource = a.merge(b)
+    print("merge other-wins", merged.serviceName(), merged.get("replicas"), "kept", merged.has("host.name"))
+    chained: OtelResource = OtelResource()
+    chained.set("k", "v")
+    chained.set("n", None)
+    print("set", chained.has("k"), "ignored-none", chained.has("n"))
+    rj: json = OtelResource({"x": 1, "y": "z"}).toJson()
+    print("resource json attributes", len(rj.attributes))
+
+    encoded: str = OtelUtil.percentEncode("a b,c=d%")
+    print("percent", encoded, "->", OtelUtil.percentDecode(encoded), "malformed", OtelUtil.percentDecode("%zz"))
+
+    Env.set("OTEL_SERVICE_NAME", "svc-env")
+    Env.set("OTEL_RESOURCE_ATTRIBUTES", "host.name=host-1,service.name=from-attrs")
+    env: OtelResource = OtelResource.fromEnv()
+    print("env from OTEL_SERVICE_NAME", env.serviceName(), env.getString("host.name"))
+}
