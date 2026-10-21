@@ -14,7 +14,7 @@
 # expect: attributeKey order-independent true type-sensitive true
 # expect: truncate héllo [ab cd] 7
 # expect: setLimited true false true size 2 overwritten 9
-# expect: resource defaults unknown_service lammergeier @lam/otel 1.0.0
+# expect: resource defaults unknown_service lammergeier @lam/otel 1.1.0
 # expect: merge other-wins api 2 kept true
 # expect: set true ignored-none false
 # expect: resource json attributes 2

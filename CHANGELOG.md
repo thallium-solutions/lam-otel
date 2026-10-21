@@ -3,6 +3,13 @@
 All notable changes to `@lam/otel` are documented here. The package follows
 semantic versioning; tags are plain versions (`1.0.0`).
 
+## [1.1.0] - 2026-10-21
+
+### Changed
+
+- The package is split into modules (`core`, `trace`, `metrics`, `logs`, `otel`), re-exported by `__init__.lam`: lamc 3.0 keeps the types of re-exported functions. Imports from `@lam/otel` are unchanged.
+- Requires `lamc` 3.0 (`>=3.0, <4`).
+
 ## [1.0.0] - 2026-10-19
 
 First release as an official Lammergeier library. `@lam/otel` replaces the

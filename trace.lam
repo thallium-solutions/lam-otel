@@ -1,0 +1,1710 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconcurrency import Mutex
+from lamerrors import Result, Error
+from lamjson import Json
+from lamstrings import Strings
+from lamtime import Time
+from .core import OtelSdkName, OtelSdkVersion, OtelUtil, OtelResource, OtelConfig, OtelExportResult, OtelOtlpHttp, otelCallWithTimeout, OtelBatchQueue
+
+# ---------------------------------------------------------------------------
+# Tracing
+# ---------------------------------------------------------------------------
+
+class OtelSpanKind {
+    #- Span kind values (the OTLP ``SpanKind`` enum). -#
+
+    static UNSPECIFIED: int = 0
+    static INTERNAL: int = 1
+    static SERVER: int = 2
+    static CLIENT: int = 3
+    static PRODUCER: int = 4
+    static CONSUMER: int = 5
+
+    static func parse(name: str) -> int {
+        #- ``"internal"``, ``"server"``, ``"client"``, ``"producer"`` or
+        ``"consumer"`` (case-insensitive, an optional ``SPAN_KIND_`` prefix
+        is accepted) as a kind value; anything else is ``INTERNAL``. -#
+        n: str = name.trim().toLower()
+        if n.startsWith("span_kind_") {
+            n = n[10:]
+        }
+        if n == "server" {
+            return OtelSpanKind.SERVER
+        }
+        if n == "client" {
+            return OtelSpanKind.CLIENT
+        }
+        if n == "producer" {
+            return OtelSpanKind.PRODUCER
+        }
+        if n == "consumer" {
+            return OtelSpanKind.CONSUMER
+        }
+        return OtelSpanKind.INTERNAL
+    }
+
+    static func name(kind: int) -> str {
+        #- The lowercase name of ``kind`` (``"internal"`` for unknown values). -#
+        if kind == OtelSpanKind.SERVER {
+            return "server"
+        }
+        if kind == OtelSpanKind.CLIENT {
+            return "client"
+        }
+        if kind == OtelSpanKind.PRODUCER {
+            return "producer"
+        }
+        if kind == OtelSpanKind.CONSUMER {
+            return "consumer"
+        }
+        return "internal"
+    }
+}
+
+class OtelStatusCode {
+    #- Span status codes (the OTLP ``Status.StatusCode`` enum). -#
+
+    static UNSET: int = 0
+    static OK: int = 1
+    static ERROR: int = 2
+
+    static func parse(name: str) -> int {
+        #- ``"ok"``/``"error"``/``"unset"`` (case-insensitive) as a code. -#
+        n: str = name.trim().toLower()
+        if n == "ok" {
+            return OtelStatusCode.OK
+        }
+        if n == "error" {
+            return OtelStatusCode.ERROR
+        }
+        return OtelStatusCode.UNSET
+    }
+
+    static func name(code: int) -> str {
+        #- ``"unset"``, ``"ok"`` or ``"error"``. -#
+        if code == OtelStatusCode.OK {
+            return "ok"
+        }
+        if code == OtelStatusCode.ERROR {
+            return "error"
+        }
+        return "unset"
+    }
+}
+
+class OtelSpanContext {
+    #- The propagated identity of a span: trace id (32 hex), span id (16
+    hex), trace flags (bit 0 = sampled), the W3C ``tracestate`` string,
+    and whether it was received from a remote process. -#
+
+    func init(self, traceId: str = "", spanId: str = "", traceFlags: int = 0, traceState: str = "", remote: bool = false) {
+        self.traceId: str = traceId
+        self.spanId: str = spanId
+        self.traceFlags: int = traceFlags
+        self.traceState: str = traceState
+        self.remote: bool = remote
+    }
+
+    static func invalid() -> OtelSpanContext {
+        #- The all-empty context (``isValid()`` is false). -#
+        return OtelSpanContext()
+    }
+
+    func isValid(self) -> bool {
+        #- True when both ids are well-formed lowercase hex and not all zeros. -#
+        return OtelUtil.isLowerHex(self.traceId, 32) and not OtelUtil.isZeroHex(self.traceId) and OtelUtil.isLowerHex(self.spanId, 16) and not OtelUtil.isZeroHex(self.spanId)
+    }
+
+    func isSampled(self) -> bool {
+        #- True when the sampled trace flag is set. -#
+        return self.traceFlags % 2 == 1
+    }
+
+    func isRemote(self) -> bool {
+        #- True when the context was extracted from incoming headers. -#
+        return self.remote
+    }
+
+    func traceparent(self) -> str {
+        #- The W3C ``traceparent`` header value (``""`` for an invalid context). -#
+        if not self.isValid() {
+            return ""
+        }
+        return "00-" + self.traceId + "-" + self.spanId + "-" + OtelUtil.hex2(self.traceFlags)
+    }
+
+    func __str__(self) -> str {
+        return self.traceparent()
+    }
+}
+
+class OtelTraceContext {
+    #- The W3C Trace Context propagator: reads and writes the
+    ``traceparent`` and ``tracestate`` headers of a ``dict[str, str]``
+    (header names are matched case-insensitively). -#
+
+    static func parseTraceparent(value: str) -> OtelSpanContext {
+        #- Parse a ``traceparent`` value. Malformed values, the forbidden
+        version ``ff``, and all-zero ids give an invalid context. Future
+        versions are accepted when their first four fields are valid. -#
+        v: str = value.trim()
+        if len(v) < 55 {
+            return OtelSpanContext.invalid()
+        }
+        version: str = v[0:2]
+        if not OtelUtil.isLowerHex(version, 2) or version == "ff" {
+            return OtelSpanContext.invalid()
+        }
+        if version == "00" and len(v) != 55 {
+            return OtelSpanContext.invalid()
+        }
+        if len(v) > 55 and v[55:56] != "-" {
+            return OtelSpanContext.invalid()
+        }
+        if v[2:3] != "-" or v[35:36] != "-" or v[52:53] != "-" {
+            return OtelSpanContext.invalid()
+        }
+        traceId: str = v[3:35]
+        spanId: str = v[36:52]
+        flagsText: str = v[53:55]
+        if not OtelUtil.isLowerHex(flagsText, 2) {
+            return OtelSpanContext.invalid()
+        }
+        ctx: OtelSpanContext = OtelSpanContext(traceId, spanId, OtelUtil.parseHex2(flagsText), "", true)
+        if not ctx.isValid() {
+            return OtelSpanContext.invalid()
+        }
+        return ctx
+    }
+
+    static func extract(headers: dict[str, str]) -> OtelSpanContext {
+        #- The remote span context carried by ``headers`` (invalid when the
+        ``traceparent`` header is missing or malformed). A valid
+        ``tracestate`` is kept, an invalid one is dropped. -#
+        ctx: OtelSpanContext = OtelTraceContext.parseTraceparent(OtelUtil.header(headers, "traceparent"))
+        if ctx.isValid() {
+            ctx.traceState = OtelTraceContext.sanitizeTraceState(OtelUtil.header(headers, "tracestate"))
+        }
+        return ctx
+    }
+
+    static func inject(ctx: OtelSpanContext, headers: dict[str, str]) {
+        #- Write ``traceparent`` (and ``tracestate`` when non-empty) for a
+        valid ``ctx``; an invalid context leaves ``headers`` unchanged. -#
+        if ctx == None or not ctx.isValid() {
+            return
+        }
+        OtelUtil.setHeader(headers, "traceparent", ctx.traceparent())
+        if ctx.traceState != "" {
+            OtelUtil.setHeader(headers, "tracestate", ctx.traceState)
+        }
+    }
+
+    static func sanitizeTraceState(value: str) -> str {
+        #- Normalise a ``tracestate`` header: trims members, drops empty
+        and malformed members and duplicate keys (the first wins), and keeps
+        at most 32 members. -#
+        out: list[str] = []
+        seen: dict[str, bool] = {}
+        for raw in value.split(",") {
+            member: str = raw.trim()
+            if member == "" {
+                continue
+            }
+            idx: int = member.index("=")
+            if idx <= 0 {
+                continue
+            }
+            key: str = member[:idx]
+            val: str = member[idx + 1:]
+            if not OtelUtil.validTraceStateMember(key, val) or key in seen {
+                continue
+            }
+            seen[key] = true
+            out.append(key + "=" + val)
+            if len(out) >= 32 {
+                break
+            }
+        }
+        return Strings.join(out, ",")
+    }
+
+    static func traceStateGet(state: str, key: str) -> str {
+        #- The value stored under ``key`` in a ``tracestate`` string. -#
+        for raw in state.split(",") {
+            member: str = raw.trim()
+            idx: int = member.index("=")
+            if idx > 0 and member[:idx] == key {
+                return member[idx + 1:]
+            }
+        }
+        return ""
+    }
+
+    static func traceStateSet(state: str, key: str, value: str) -> str {
+        #- A new ``tracestate`` with ``key=value`` moved to the front (as the
+        W3C specification requires for an updated member). Invalid members
+        leave ``state`` unchanged. -#
+        if not OtelUtil.validTraceStateMember(key, value) {
+            return state
+        }
+        rest: str = OtelTraceContext.traceStateDelete(state, key)
+        if rest == "" {
+            return key + "=" + value
+        }
+        members: list[str] = rest.split(",")
+        if len(members) >= 32 {
+            members = members[:31]
+        }
+        return key + "=" + value + "," + Strings.join(members, ",")
+    }
+
+    static func traceStateDelete(state: str, key: str) -> str {
+        #- A new ``tracestate`` without ``key``. -#
+        out: list[str] = []
+        for raw in OtelTraceContext.sanitizeTraceState(state).split(",") {
+            if raw == "" {
+                continue
+            }
+            idx: int = raw.index("=")
+            if raw[:idx] != key {
+                out.append(raw)
+            }
+        }
+        return Strings.join(out, ",")
+    }
+}
+
+class OtelBaggage {
+    #- W3C Baggage: user-defined ``key=value`` pairs propagated alongside
+    the trace context in the ``baggage`` header. Values are
+    percent-encoded on the wire; optional per-entry metadata (the text
+    after ``;``) is preserved. -#
+
+    static MAX_MEMBERS: int = 180
+    static MAX_BYTES: int = 8192
+
+    func init(self) {
+        self.entries: dict[str, str] = {}
+        self.metadata: dict[str, str] = {}
+    }
+
+    func set(self, key: str, value: str, metadata: str = "") {
+        #- Store ``key=value`` (keys must be RFC 7230 tokens; invalid keys
+        are ignored). -#
+        k: str = key.trim()
+        if not OtelUtil.validToken(k) {
+            return
+        }
+        if k not in self.entries and len(self.entries) >= OtelBaggage.MAX_MEMBERS {
+            return
+        }
+        self.entries[k] = value
+        if metadata.trim() != "" {
+            self.metadata[k] = metadata.trim()
+        } elif k in self.metadata {
+            del self.metadata[k]
+        }
+    }
+
+    func get(self, key: str) -> str {
+        #- The value for ``key`` (``""`` when absent). -#
+        if key in self.entries {
+            return self.entries[key]
+        }
+        return ""
+    }
+
+    func getMetadata(self, key: str) -> str {
+        #- The metadata of ``key`` (``""`` when absent). -#
+        if key in self.metadata {
+            return self.metadata[key]
+        }
+        return ""
+    }
+
+    func has(self, key: str) -> bool {
+        #- True when ``key`` is present. -#
+        return key in self.entries
+    }
+
+    func remove(self, key: str) {
+        #- Delete ``key`` (no-op when absent). -#
+        if key in self.entries {
+            del self.entries[key]
+        }
+        if key in self.metadata {
+            del self.metadata[key]
+        }
+    }
+
+    func keys(self) -> list[str] {
+        #- The entry keys in ascending order. -#
+        out: list[str] = []
+        for k, _v in self.entries {
+            out.append(k)
+        }
+        return out.sort()
+    }
+
+    func size(self) -> int {
+        #- Number of entries. -#
+        return len(self.entries)
+    }
+
+    func isEmpty(self) -> bool {
+        #- True when there are no entries. -#
+        return len(self.entries) == 0
+    }
+
+    func copy(self) -> OtelBaggage {
+        #- An independent copy. -#
+        out: OtelBaggage = OtelBaggage()
+        for k, v in self.entries {
+            out.entries[k] = v
+        }
+        for k, v in self.metadata {
+            out.metadata[k] = v
+        }
+        return out
+    }
+
+    func toHeader(self) -> str {
+        #- The ``baggage`` header value (keys sorted). Members that would
+        push the header beyond 8192 bytes are left out. -#
+        out: str = ""
+        for k in self.keys() {
+            member: str = k + "=" + OtelUtil.percentEncode(self.entries[k])
+            if k in self.metadata {
+                member = member + ";" + self.metadata[k]
+            }
+            candidate: str = member if out == "" else out + "," + member
+            if len(candidate) > OtelBaggage.MAX_BYTES {
+                continue
+            }
+            out = candidate
+        }
+        return out
+    }
+
+    static func fromHeader(value: str) -> OtelBaggage {
+        #- Parse a ``baggage`` header. Malformed members are skipped and
+        values are percent-decoded. -#
+        out: OtelBaggage = OtelBaggage()
+        if len(value) > OtelBaggage.MAX_BYTES * 2 {
+            return out
+        }
+        for raw in value.split(",") {
+            member: str = raw.trim()
+            if member == "" {
+                continue
+            }
+            meta: str = ""
+            semi: int = member.index(";")
+            if semi >= 0 {
+                meta = member[semi + 1:].trim()
+                member = member[:semi].trim()
+            }
+            idx: int = member.index("=")
+            if idx <= 0 {
+                continue
+            }
+            key: str = member[:idx].trim()
+            val: str = OtelUtil.percentDecode(member[idx + 1:].trim())
+            out.set(key, val, meta)
+        }
+        return out
+    }
+
+    static func extract(headers: dict[str, str]) -> OtelBaggage {
+        #- The baggage carried by the ``baggage`` header of ``headers``. -#
+        return OtelBaggage.fromHeader(OtelUtil.header(headers, "baggage"))
+    }
+
+    func inject(self, headers: dict[str, str]) {
+        #- Write the ``baggage`` header (nothing when empty). -#
+        text: str = self.toHeader()
+        if text != "" {
+            OtelUtil.setHeader(headers, "baggage", text)
+        }
+    }
+}
+
+class OtelPropagator {
+    #- Composite propagator selected by ``OTEL_PROPAGATORS``: ``tracecontext``
+    and ``baggage`` are supported (``none`` disables propagation; other
+    names are ignored). -#
+
+    func init(self, traceContext: bool = true, baggage: bool = true) {
+        self.traceContext: bool = traceContext
+        self.baggage: bool = baggage
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelPropagator {
+        #- The propagator described by ``cfg.propagators``. -#
+        return OtelPropagator.parse(cfg.propagators)
+    }
+
+    static func parse(names: str) -> OtelPropagator {
+        #- Build a propagator from a comma-separated list of names. -#
+        p: OtelPropagator = OtelPropagator(false, false)
+        for raw in names.split(",") {
+            n: str = raw.trim().toLower()
+            if n == "tracecontext" {
+                p.traceContext = true
+            } elif n == "baggage" {
+                p.baggage = true
+            }
+        }
+        return p
+    }
+
+    func fields(self) -> list[str] {
+        #- The header names this propagator reads and writes. -#
+        out: list[str] = []
+        if self.traceContext {
+            out.append("traceparent")
+            out.append("tracestate")
+        }
+        if self.baggage {
+            out.append("baggage")
+        }
+        return out
+    }
+
+    func inject(self, headers: dict[str, str], ctx: OtelSpanContext, baggage: OtelBaggage = None) {
+        #- Write the enabled headers for ``ctx`` and ``baggage``. -#
+        if self.traceContext and ctx != None {
+            OtelTraceContext.inject(ctx, headers)
+        }
+        if self.baggage and baggage != None {
+            baggage.inject(headers)
+        }
+    }
+
+    func extract(self, headers: dict[str, str]) -> OtelSpanContext {
+        #- The remote span context (invalid when disabled or absent). -#
+        if not self.traceContext {
+            return OtelSpanContext.invalid()
+        }
+        return OtelTraceContext.extract(headers)
+    }
+
+    func extractBaggage(self, headers: dict[str, str]) -> OtelBaggage {
+        #- The incoming baggage (empty when disabled or absent). -#
+        if not self.baggage {
+            return OtelBaggage()
+        }
+        return OtelBaggage.extract(headers)
+    }
+}
+
+class OtelSamplingDecision {
+    #- Sampler decisions. ``DROP``: the span is not recorded;
+    ``RECORD_ONLY``: recorded but not exported (sampled flag unset);
+    ``RECORD_AND_SAMPLE``: recorded and exported. -#
+
+    static DROP: int = 0
+    static RECORD_ONLY: int = 1
+    static RECORD_AND_SAMPLE: int = 2
+}
+
+class OtelSampler {
+    #- Head sampler. Built-ins: ``alwaysOn``, ``alwaysOff``,
+    ``traceIdRatio(ratio)``, ``parentBased(root)`` (follows the parent's
+    sampled flag and delegates root spans to ``root``) and ``custom``. -#
+
+    func init(self, kind: str = "always_on", ratio: float = 1.0) {
+        self.kind: str = kind
+        self.ratio: float = ratio
+        self.root: OtelSampler = None
+        self.remoteParentSampled: OtelSampler = None
+        self.remoteParentNotSampled: OtelSampler = None
+        self.localParentSampled: OtelSampler = None
+        self.localParentNotSampled: OtelSampler = None
+        self.customName: str = ""
+        self.customFn: func(OtelSpanContext, str, str, int, dict[str, any]) -> int = None
+    }
+
+    static func alwaysOn() -> OtelSampler {
+        #- Sample every span. -#
+        return OtelSampler("always_on", 1.0)
+    }
+
+    static func alwaysOff() -> OtelSampler {
+        #- Drop every span. -#
+        return OtelSampler("always_off", 0.0)
+    }
+
+    static func traceIdRatio(ratio: float) -> OtelSampler {
+        #- Sample ``ratio`` (clamped to 0..1) of the traces, deterministically
+        from the trace id so every service makes the same decision. -#
+        r: float = ratio
+        if r < 0.0 {
+            r = 0.0
+        }
+        if r > 1.0 {
+            r = 1.0
+        }
+        return OtelSampler("traceidratio", r)
+    }
+
+    static func parentBased(root: OtelSampler) -> OtelSampler {
+        #- Respect the parent's sampled flag (remote or local); root spans
+        use ``root``. The four parent delegates are public fields and can be
+        replaced. -#
+        s: OtelSampler = OtelSampler("parentbased", 1.0)
+        s.root = root if root != None else OtelSampler.alwaysOn()
+        s.remoteParentSampled = OtelSampler.alwaysOn()
+        s.remoteParentNotSampled = OtelSampler.alwaysOff()
+        s.localParentSampled = OtelSampler.alwaysOn()
+        s.localParentNotSampled = OtelSampler.alwaysOff()
+        return s
+    }
+
+    static func custom(name: str, fn: func(OtelSpanContext, str, str, int, dict[str, any]) -> int) -> OtelSampler {
+        #- A sampler calling ``fn(parent, traceId, spanName, kind,
+        attributes)`` which returns an ``OtelSamplingDecision`` value. -#
+        s: OtelSampler = OtelSampler("custom", 1.0)
+        s.customName = name
+        s.customFn = fn
+        return s
+    }
+
+    static func fromConfig(name: str, arg: str = "") -> OtelSampler {
+        #- The sampler named by ``OTEL_TRACES_SAMPLER`` (``always_on``,
+        ``always_off``, ``traceidratio``, ``parentbased_always_on``,
+        ``parentbased_always_off``, ``parentbased_traceidratio``) with the
+        ratio from ``OTEL_TRACES_SAMPLER_ARG`` (default 1.0). Unknown names
+        fall back to ``parentbased_always_on``. -#
+        ratio: float = 1.0
+        if arg.trim() != "" {
+            ratio = OtelUtil.parseFloatOr(arg.trim(), 1.0)
+        }
+        n: str = name.trim().toLower()
+        if n == "always_on" {
+            return OtelSampler.alwaysOn()
+        }
+        if n == "always_off" {
+            return OtelSampler.alwaysOff()
+        }
+        if n == "traceidratio" {
+            return OtelSampler.traceIdRatio(ratio)
+        }
+        if n == "parentbased_always_off" {
+            return OtelSampler.parentBased(OtelSampler.alwaysOff())
+        }
+        if n == "parentbased_traceidratio" {
+            return OtelSampler.parentBased(OtelSampler.traceIdRatio(ratio))
+        }
+        return OtelSampler.parentBased(OtelSampler.alwaysOn())
+    }
+
+    func shouldSample(self, parent: OtelSpanContext, traceId: str, name: str, kind: int, attributes: dict[str, any]) -> int {
+        #- The ``OtelSamplingDecision`` for a new span. -#
+        if self.kind == "always_on" {
+            return OtelSamplingDecision.RECORD_AND_SAMPLE
+        }
+        if self.kind == "always_off" {
+            return OtelSamplingDecision.DROP
+        }
+        if self.kind == "traceidratio" {
+            if OtelUtil.ratioSampled(traceId, self.ratio) {
+                return OtelSamplingDecision.RECORD_AND_SAMPLE
+            }
+            return OtelSamplingDecision.DROP
+        }
+        if self.kind == "custom" {
+            if self.customFn == None {
+                return OtelSamplingDecision.DROP
+            }
+            fn: func(OtelSpanContext, str, str, int, dict[str, any]) -> int = self.customFn
+            return fn(parent, traceId, name, kind, attributes)
+        }
+        if self.kind == "parentbased" {
+            if parent == None or not parent.isValid() {
+                return self.root.shouldSample(parent, traceId, name, kind, attributes)
+            }
+            delegate: OtelSampler = self.localParentNotSampled
+            if parent.remote {
+                delegate = self.remoteParentSampled if parent.isSampled() else self.remoteParentNotSampled
+            } elif parent.isSampled() {
+                delegate = self.localParentSampled
+            }
+            return delegate.shouldSample(parent, traceId, name, kind, attributes)
+        }
+        return OtelSamplingDecision.RECORD_AND_SAMPLE
+    }
+
+    func description(self) -> str {
+        #- A human-readable description such as
+        ``ParentBased{root=TraceIdRatioBased{0.25}}``. -#
+        if self.kind == "always_on" {
+            return "AlwaysOnSampler"
+        }
+        if self.kind == "always_off" {
+            return "AlwaysOffSampler"
+        }
+        if self.kind == "traceidratio" {
+            return "TraceIdRatioBased{" + OtelUtil.floatString(self.ratio) + "}"
+        }
+        if self.kind == "custom" {
+            return self.customName
+        }
+        return "ParentBased{root=" + self.root.description() + "}"
+    }
+}
+
+class OtelSpanLimits {
+    #- Limits applied to every recording span. ``-1`` means unlimited.
+    Attributes, events or links beyond a limit are dropped and counted. -#
+
+    func init(self, attributeCountLimit: int = 128, attributeValueLengthLimit: int = -1, eventCountLimit: int = 128, linkCountLimit: int = 128, attributePerEventCountLimit: int = 128, attributePerLinkCountLimit: int = 128) {
+        self.attributeCountLimit: int = attributeCountLimit
+        self.attributeValueLengthLimit: int = attributeValueLengthLimit
+        self.eventCountLimit: int = eventCountLimit
+        self.linkCountLimit: int = linkCountLimit
+        self.attributePerEventCountLimit: int = attributePerEventCountLimit
+        self.attributePerLinkCountLimit: int = attributePerLinkCountLimit
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelSpanLimits {
+        #- Limits from ``OTEL_SPAN_*``/``OTEL_EVENT_*``/``OTEL_LINK_*`` with
+        ``OTEL_ATTRIBUTE_*`` as the fallback for attribute limits. -#
+        countLimit: int = cfg.spanAttributeCountLimit
+        if countLimit == -2 {
+            countLimit = cfg.attributeCountLimit
+        }
+        lengthLimit: int = cfg.spanAttributeValueLengthLimit
+        if lengthLimit == -2 {
+            lengthLimit = cfg.attributeValueLengthLimit
+        }
+        return OtelSpanLimits(countLimit, lengthLimit, cfg.spanEventCountLimit, cfg.spanLinkCountLimit, cfg.eventAttributeCountLimit, cfg.linkAttributeCountLimit)
+    }
+}
+
+class OtelSpanEvent {
+    #- A timestamped annotation on a span. -#
+
+    func init(self, name: str, timeUnixNano: int = 0, attributes: dict[str, any] = {}) {
+        self.name: str = name
+        self.timeUnixNano: int = timeUnixNano
+        if self.timeUnixNano <= 0 {
+            self.timeUnixNano = Time.nowUnixNano()
+        }
+        self.attributes: dict[str, any] = {}
+        self.droppedAttributesCount: int = 0
+        for k, v in attributes {
+            self.attributes[k] = v
+        }
+    }
+
+    func toJson(self) -> json {
+        #- The OTLP/JSON ``Span.Event`` message. -#
+        return {
+            "timeUnixNano": str(self.timeUnixNano),
+            "name": self.name,
+            "attributes": OtelUtil.attributesJson(self.attributes),
+            "droppedAttributesCount": self.droppedAttributesCount,
+        }
+    }
+}
+
+class OtelSpanLink {
+    #- A reference from a span to another span context (for example the
+    producer of a batch of messages). -#
+
+    func init(self, context: OtelSpanContext, attributes: dict[str, any] = {}) {
+        self.context: OtelSpanContext = context
+        self.attributes: dict[str, any] = {}
+        self.droppedAttributesCount: int = 0
+        for k, v in attributes {
+            self.attributes[k] = v
+        }
+    }
+
+    func toJson(self) -> json {
+        #- The OTLP/JSON ``Span.Link`` message. -#
+        return {
+            "traceId": self.context.traceId,
+            "spanId": self.context.spanId,
+            "traceState": self.context.traceState,
+            "flags": self.context.traceFlags,
+            "attributes": OtelUtil.attributesJson(self.attributes),
+            "droppedAttributesCount": self.droppedAttributesCount,
+        }
+    }
+}
+
+interface OtelSpanProcessor {
+    #- Hooks invoked by the SDK for every recording span: ``onStart`` when
+    the span starts (it may still be modified), ``onEnd`` once it ended
+    (sampled or record-only), ``forceFlush`` to export buffered spans and
+    ``shutdown`` (idempotent) when the provider shuts down. Implement it
+    to enrich, filter or route spans. -#
+    func onStart(self, span: OtelSpan)
+    func onEnd(self, span: OtelSpan)
+    func forceFlush(self) -> Result[bool]
+    func shutdown(self) -> Result[bool]
+}
+
+interface OtelSpanExporter {
+    #- Destination for finished, sampled spans: ``export`` receives one
+    batch at a time (never concurrently) and ``shutdown`` releases
+    resources; exports after shutdown should fail with
+    ``OtelShutdownError``. -#
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult]
+    func shutdown(self) -> Result[bool]
+}
+
+class OtelSpan {
+    #- A unit of work in a trace. Create spans through ``OtelTracer`` so
+    sampling, limits, resource and processors apply; a span built directly
+    with the constructor is a stand-alone recording span (useful with
+    ``OtelSpanBatch``). Every mutating method is safe to call from several
+    goroutines and is ignored once the span has ended or when it is not
+    recording. -#
+
+    func init(self, name: str, kind: int = 1, traceId: str = "", spanId: str = "") {
+        self.name: str = name
+        self.kind: int = kind
+        self.traceId: str = traceId
+        self.spanId: str = spanId
+        self.traceFlags: int = 1
+        self.traceState: str = ""
+        self.parentSpanId: str = ""
+        self.parentRemote: bool = false
+        self.startTimeUnixNano: int = Time.nowUnixNano()
+        self.endTimeUnixNano: int = 0
+        self.attributes: dict[str, any] = {}
+        self.droppedAttributesCount: int = 0
+        self.events: list[OtelSpanEvent] = []
+        self.droppedEventsCount: int = 0
+        self.links: list[OtelSpanLink] = []
+        self.droppedLinksCount: int = 0
+        self.statusCode: int = 0
+        self.statusMessage: str = ""
+        self.resource: OtelResource = OtelResource.sdkDefaults()
+        self.scopeName: str = OtelSdkName
+        self.scopeVersion: str = OtelSdkVersion
+        self.limits: OtelSpanLimits = OtelSpanLimits()
+        self.processors: list[OtelSpanProcessor] = []
+        self.recording: bool = true
+        self.ended: bool = false
+        self.lock: Mutex = Mutex()
+        if self.traceId == "" {
+            self.traceId = OtelUtil.traceId()
+        }
+        if self.spanId == "" {
+            self.spanId = OtelUtil.spanId()
+        }
+    }
+
+    func spanContext(self) -> OtelSpanContext {
+        #- The span's propagated identity. -#
+        return OtelSpanContext(self.traceId, self.spanId, self.traceFlags, self.traceState, false)
+    }
+
+    func isRecording(self) -> bool {
+        #- True while the span records data (not dropped by the sampler
+        and not yet ended). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.recording and not self.ended
+    }
+
+    func isSampled(self) -> bool {
+        #- True when the span will be exported. -#
+        return self.traceFlags % 2 == 1
+    }
+
+    func isEnded(self) -> bool {
+        #- True once ``end()`` has been called. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.ended
+    }
+
+    func setParent(self, parentSpanId: str) {
+        #- Set the parent span id by hand (prefer ``OtelTracer.startSpan``
+        with ``parent=``). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if not self.ended {
+            self.parentSpanId = parentSpanId
+        }
+    }
+
+    func setAttribute(self, key: str, value: any) {
+        #- Set one attribute. Values may be ``str``, ``bool``, ``int``,
+        ``float``, ``bytes`` or homogeneous lists of those; ``None`` values
+        and empty keys are ignored. New keys beyond the attribute count
+        limit are dropped and counted. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.ended or not self.recording {
+            return
+        }
+        if not OtelUtil.setLimited(self.attributes, key, value, self.limits.attributeCountLimit, self.limits.attributeValueLengthLimit) {
+            self.droppedAttributesCount += 1
+        }
+    }
+
+    func setAttributes(self, attributes: dict[str, any]) {
+        #- Set several attributes (see ``setAttribute``). -#
+        for k in OtelUtil.sortedKeys(attributes) {
+            self.setAttribute(k, attributes[k])
+        }
+    }
+
+    func getAttribute(self, key: str) -> any {
+        #- The attribute stored under ``key`` (``None`` when absent). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if key in self.attributes {
+            return self.attributes[key]
+        }
+        return None
+    }
+
+    func updateName(self, name: str) {
+        #- Rename the span (for example once the HTTP route is known). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if not self.ended and self.recording and name != "" {
+            self.name = name
+        }
+    }
+
+    func _limitedAttributes(self, attributes: dict[str, any], countLimit: int) -> (dict[str, any], int) {
+        out: dict[str, any] = {}
+        dropped: int = 0
+        for k in OtelUtil.sortedKeys(attributes) {
+            if not OtelUtil.setLimited(out, k, attributes[k], countLimit, self.limits.attributeValueLengthLimit) {
+                dropped += 1
+            }
+        }
+        return out, dropped
+    }
+
+    func addEvent(self, name: str, attributes: dict[str, any] = {}, timeUnixNano: int = 0) {
+        #- Append a timestamped event (``timeUnixNano`` 0 = now). Events
+        beyond the event count limit are dropped and counted. -#
+        ev: OtelSpanEvent = OtelSpanEvent(name, timeUnixNano)
+        attrs, dropped = self._limitedAttributes(attributes, self.limits.attributePerEventCountLimit)
+        ev.attributes = attrs
+        ev.droppedAttributesCount = dropped
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.ended or not self.recording {
+            return
+        }
+        if self.limits.eventCountLimit >= 0 and len(self.events) >= self.limits.eventCountLimit {
+            self.droppedEventsCount += 1
+            return
+        }
+        self.events.append(ev)
+    }
+
+    func addLink(self, context: OtelSpanContext, attributes: dict[str, any] = {}) {
+        #- Link this span to ``context`` (invalid contexts are ignored).
+        Links beyond the link count limit are dropped and counted. -#
+        if context == None or not context.isValid() {
+            return
+        }
+        link: OtelSpanLink = OtelSpanLink(context)
+        attrs, dropped = self._limitedAttributes(attributes, self.limits.attributePerLinkCountLimit)
+        link.attributes = attrs
+        link.droppedAttributesCount = dropped
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.ended or not self.recording {
+            return
+        }
+        if self.limits.linkCountLimit >= 0 and len(self.links) >= self.limits.linkCountLimit {
+            self.droppedLinksCount += 1
+            return
+        }
+        self.links.append(link)
+    }
+
+    func setStatus(self, code: int, description: str = "") {
+        #- Set the status (``OtelStatusCode``). ``OK`` is final; the
+        description is only kept for ``ERROR``; ``UNSET`` never overrides a
+        status that was already set. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.ended or not self.recording {
+            return
+        }
+        if self.statusCode == OtelStatusCode.OK or code == OtelStatusCode.UNSET {
+            return
+        }
+        if code == OtelStatusCode.ERROR {
+            self.statusCode = OtelStatusCode.ERROR
+            self.statusMessage = description
+        } elif code == OtelStatusCode.OK {
+            self.statusCode = OtelStatusCode.OK
+            self.statusMessage = ""
+        }
+    }
+
+    func recordException(self, message: str, exceptionType: str = "", stacktrace: str = "", attributes: dict[str, any] = {}) {
+        #- Add an ``exception`` event with the ``exception.message``,
+        ``exception.type`` and ``exception.stacktrace`` semantic attributes.
+        The status is left alone; call ``setStatus(OtelStatusCode.ERROR,
+        ...)`` too when the exception fails the operation. -#
+        attrs: dict[str, any] = {}
+        for k, v in attributes {
+            attrs[k] = v
+        }
+        attrs["exception.message"] = message
+        if exceptionType != "" {
+            attrs["exception.type"] = exceptionType
+        }
+        if stacktrace != "" {
+            attrs["exception.stacktrace"] = stacktrace
+        }
+        self.addEvent("exception", attrs)
+    }
+
+    func recordError(self, err: Error, attributes: dict[str, any] = {}) {
+        #- ``recordException`` for a ``lamerrors.Error``: ``exception.type``
+        is the error kind and ``exception.message`` its message (the cause
+        chain is appended to the message). -#
+        if err == None {
+            return
+        }
+        message: str = err.message
+        cause: any = err.cause
+        if cause != None {
+            message = message + " (caused by: " + str(cause) + ")"
+        }
+        kind: str = err.kind
+        if kind == "" {
+            kind = "Error"
+        }
+        self.recordException(message, kind, "", attributes)
+    }
+
+    func fail(self, message: str) {
+        #- Shortcut for a failed operation: ``recordException(message)``
+        plus ``setStatus(OtelStatusCode.ERROR, message)``. -#
+        self.recordException(message)
+        self.setStatus(OtelStatusCode.ERROR, message)
+    }
+
+    func end(self, endTimeUnixNano: int = 0) {
+        #- Finish the span (``endTimeUnixNano`` 0 = now) and hand it to the
+        processors. Only the first call has an effect. -#
+        self.lock.lock()
+        if self.ended {
+            self.lock.unlock()
+            return
+        }
+        self.ended = true
+        self.endTimeUnixNano = endTimeUnixNano if endTimeUnixNano > 0 else Time.nowUnixNano()
+        if self.endTimeUnixNano < self.startTimeUnixNano {
+            self.endTimeUnixNano = self.startTimeUnixNano
+        }
+        recording: bool = self.recording
+        processors: list[OtelSpanProcessor] = self.processors
+        self.lock.unlock()
+        if not recording {
+            return
+        }
+        for p in processors {
+            p.onEnd(self)
+        }
+    }
+
+    func durationNanos(self) -> int {
+        #- Elapsed nanoseconds (up to now while the span is open). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.endTimeUnixNano == 0 {
+            return Time.nowUnixNano() - self.startTimeUnixNano
+        }
+        return self.endTimeUnixNano - self.startTimeUnixNano
+    }
+
+    func durationMs(self) -> int {
+        #- Elapsed milliseconds (up to now while the span is open). -#
+        return self.durationNanos() // 1000000
+    }
+
+    func inject(self, headers: dict[str, str]) {
+        #- Write this span's ``traceparent``/``tracestate`` into ``headers``
+        (for an outgoing request made inside the span). -#
+        OtelTraceContext.inject(self.spanContext(), headers)
+    }
+
+    func eventNames(self) -> list[str] {
+        #- The names of the recorded events, in order. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        out: list[str] = []
+        for ev in self.events {
+            out.append(ev.name)
+        }
+        return out
+    }
+
+    func toJson(self) -> json {
+        #- The OTLP/JSON ``Span`` message. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        events: list[json] = []
+        for ev in self.events {
+            events.append(ev.toJson())
+        }
+        links: list[json] = []
+        for link in self.links {
+            links.append(link.toJson())
+        }
+        status: json = {"code": self.statusCode}
+        if self.statusMessage != "" {
+            status["message"] = self.statusMessage
+        }
+        flags: int = self.traceFlags % 256 + 256
+        if self.parentRemote {
+            flags = flags + 512
+        }
+        out: json = {
+            "traceId": self.traceId,
+            "spanId": self.spanId,
+            "flags": flags,
+            "name": self.name,
+            "kind": self.kind,
+            "startTimeUnixNano": str(self.startTimeUnixNano),
+            "endTimeUnixNano": str(self.endTimeUnixNano),
+            "attributes": OtelUtil.attributesJson(self.attributes),
+            "droppedAttributesCount": self.droppedAttributesCount,
+            "events": events,
+            "droppedEventsCount": self.droppedEventsCount,
+            "links": links,
+            "droppedLinksCount": self.droppedLinksCount,
+            "status": status,
+        }
+        if self.traceState != "" {
+            out["traceState"] = self.traceState
+        }
+        if self.parentSpanId != "" {
+            out["parentSpanId"] = self.parentSpanId
+        }
+        return out
+    }
+}
+
+class OtelTraceJson {
+    #- OTLP/JSON encoding of spans (``ExportTraceServiceRequest``). -#
+
+    static func payload(spans: list[OtelSpan]) -> json {
+        #- Group ``spans`` by resource and instrumentation scope and encode
+        them as ``{"resourceSpans": [...]}``. -#
+        resourceOrder: list[str] = []
+        resources: dict[str, OtelResource] = {}
+        scopeOrder: dict[str, list[str]] = {}
+        scopeSpans: dict[str, list[json]] = {}
+        scopeInfo: dict[str, OtelSpan] = {}
+        for item in spans {
+            span: OtelSpan = item
+            rkey: str = span.resource.key()
+            if rkey not in resources {
+                resources[rkey] = span.resource
+                resourceOrder.append(rkey)
+                scopeOrder[rkey] = []
+            }
+            skey: str = rkey + "\x1d" + span.scopeName + "\x1d" + span.scopeVersion
+            if skey not in scopeSpans {
+                scopeSpans[skey] = []
+                scopeInfo[skey] = span
+                order: list[str] = scopeOrder[rkey]
+                order.append(skey)
+                scopeOrder[rkey] = order
+            }
+            encoded: list[json] = scopeSpans[skey]
+            encoded.append(span.toJson())
+            scopeSpans[skey] = encoded
+        }
+        out: list[json] = []
+        for rkey in resourceOrder {
+            scopes: list[json] = []
+            for skey in scopeOrder[rkey] {
+                first: OtelSpan = scopeInfo[skey]
+                scopes.append({
+                    "scope": {"name": first.scopeName, "version": first.scopeVersion},
+                    "spans": scopeSpans[skey],
+                })
+            }
+            res: OtelResource = resources[rkey]
+            out.append({"resource": res.toJson(), "scopeSpans": scopes})
+        }
+        return {"resourceSpans": out}
+    }
+}
+
+class OtelOtlpSpanExporter {
+    #- Exports spans as OTLP/HTTP JSON to ``tracesUrl()`` of the
+    configuration, with its headers, timeout, compression and retry
+    policy (see ``OtelOtlpHttp``). -#
+
+    func init(self, cfg: OtelConfig = None) {
+        c: OtelConfig = cfg if cfg != None else OtelConfig.fromEnv()
+        self.transport: OtelOtlpHttp = OtelOtlpHttp.forSignal(c, "traces")
+        self.stopped: bool = false
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        #- POST ``spans``; ``Ok`` with the collector's response on success. -#
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "span exporter is shut down", None))
+        }
+        if len(spans) == 0 {
+            return Result.Ok(OtelExportResult(0, "", 0, 0))
+        }
+        return self.transport.send(OtelTraceJson.payload(spans), len(spans))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports. -#
+        self.stopped = true
+        return Result.Ok(true)
+    }
+}
+
+class OtelInMemorySpanExporter {
+    #- Keeps exported spans in memory: the exporter to use in tests. -#
+
+    func init(self) {
+        self.spans: list[OtelSpan] = []
+        self.exportCalls: int = 0
+        self.stopped: bool = false
+        self.lock: Mutex = Mutex()
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        #- Append ``spans`` to the finished-span list. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "span exporter is shut down", None))
+        }
+        self.exportCalls += 1
+        for span in spans {
+            self.spans.append(span)
+        }
+        return Result.Ok(OtelExportResult(0, "", 1, len(spans)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports (finished spans stay readable). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.stopped = true
+        return Result.Ok(true)
+    }
+
+    func finishedSpans(self) -> list[OtelSpan] {
+        #- A copy of the exported spans, in export order. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        out: list[OtelSpan] = []
+        for span in self.spans {
+            out.append(span)
+        }
+        return out
+    }
+
+    func count(self) -> int {
+        #- Number of exported spans. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return len(self.spans)
+    }
+
+    func names(self) -> list[str] {
+        #- The names of the exported spans, in export order. -#
+        out: list[str] = []
+        for span in self.finishedSpans() {
+            out.append(span.name)
+        }
+        return out
+    }
+
+    func find(self, name: str) -> OtelSpan {
+        #- The first exported span named ``name`` (``None`` when absent). -#
+        for span in self.finishedSpans() {
+            if span.name == name {
+                return span
+            }
+        }
+        return None
+    }
+
+    func reset(self) {
+        #- Forget the exported spans. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.spans = []
+    }
+}
+
+class OtelConsoleSpanExporter {
+    #- Writes every exported span as one JSON line (the OTLP span plus its
+    resource and scope) to standard output, or to ``out`` when given. -#
+
+    func init(self, out: func(str) = None) {
+        self.out: func(str) = out
+        self.stopped: bool = false
+    }
+
+    static func format(span: OtelSpan) -> str {
+        #- The console line for ``span``. -#
+        doc: json = {
+            "resource": span.resource.toJson(),
+            "scope": {"name": span.scopeName, "version": span.scopeVersion},
+            "span": span.toJson(),
+        }
+        return Json.encode(doc).unwrapOr("{}")
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        #- Write one line per span. -#
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "span exporter is shut down", None))
+        }
+        for span in spans {
+            line: str = OtelConsoleSpanExporter.format(span)
+            if self.out == None {
+                print(line)
+            } else {
+                writer: func(str) = self.out
+                writer(line)
+            }
+        }
+        return Result.Ok(OtelExportResult(0, "", 1, len(spans)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports. -#
+        self.stopped = true
+        return Result.Ok(true)
+    }
+}
+
+class OtelSimpleSpanProcessor {
+    #- Exports every sampled span synchronously when it ends. Simple and
+    immediate; prefer ``OtelBatchSpanProcessor`` in production. -#
+
+    func init(self, exporter: OtelSpanExporter) {
+        self.exporter: OtelSpanExporter = exporter
+        self.lock: Mutex = Mutex()
+        self.stopped: bool = false
+        self.failedCount: int = 0
+        self.lastError: str = ""
+    }
+
+    func onStart(self, span: OtelSpan) {
+        #- No-op. -#
+        _ = span
+    }
+
+    func onEnd(self, span: OtelSpan) {
+        #- Export ``span`` when it is sampled. -#
+        if not span.isSampled() {
+            return
+        }
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.stopped {
+            return
+        }
+        batch: list[OtelSpan] = [span]
+        exporter: OtelSpanExporter = self.exporter
+        # Run through otelCallWithTimeout (no deadline) so a panicking
+        # exporter is reported as an error instead of crashing the caller.
+        res: Result[OtelExportResult] = otelCallWithTimeout(0, lambda: exporter.export(batch))
+        if not res.ok() {
+            self.failedCount += 1
+            self.lastError = str(res.error)
+        }
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Nothing is buffered: always ``Ok(true)``. -#
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Shut the exporter down. Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        self.lock.unlock()
+        return self.exporter.shutdown()
+    }
+}
+
+class OtelBatchSpanProcessor {
+    #- Buffers sampled spans and exports them in batches from a background
+    goroutine: every ``scheduleDelayMs``, as soon as ``maxExportBatchSize``
+    spans are queued, on ``forceFlush()`` and on ``shutdown()``. When
+    ``maxQueueSize`` spans are waiting, new spans are dropped (see
+    ``dropped()``). Each export is bounded by ``exportTimeoutMs``. -#
+
+    func init(self, exporter: OtelSpanExporter, maxQueueSize: int = 2048, scheduleDelayMs: int = 5000, maxExportBatchSize: int = 512, exportTimeoutMs: int = 30000) {
+        self.exporter: OtelSpanExporter = exporter
+        self.queue: OtelBatchQueue[OtelSpan] = OtelBatchQueue[OtelSpan](self._export, maxQueueSize, scheduleDelayMs, maxExportBatchSize, exportTimeoutMs)
+        self.stopped: bool = false
+        self.lock: Mutex = Mutex()
+    }
+
+    static func fromConfig(exporter: OtelSpanExporter, cfg: OtelConfig) -> OtelBatchSpanProcessor {
+        #- A processor using the ``OTEL_BSP_*`` settings of ``cfg``. -#
+        return OtelBatchSpanProcessor(exporter, cfg.bspMaxQueueSize, cfg.bspScheduleDelayMs, cfg.bspMaxExportBatchSize, cfg.bspExportTimeoutMs)
+    }
+
+    private func _export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        return self.exporter.export(spans)
+    }
+
+    func onStart(self, span: OtelSpan) {
+        #- No-op. -#
+        _ = span
+    }
+
+    func onEnd(self, span: OtelSpan) {
+        #- Queue ``span`` when it is sampled. -#
+        if span.isSampled() {
+            _ = self.queue.push(span)
+        }
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Export everything queued now. -#
+        return self.queue.drain()
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Stop the worker, export what is queued and shut the exporter
+        down. Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        self.lock.unlock()
+        flushed: Result[bool] = self.queue.close()
+        closed: Result[bool] = self.exporter.shutdown()
+        if not flushed.ok() {
+            return flushed
+        }
+        return closed
+    }
+
+    func queued(self) -> int {
+        #- Spans waiting for export. -#
+        return self.queue.size()
+    }
+
+    func dropped(self) -> int {
+        #- Spans dropped because the queue was full. -#
+        return self.queue.dropped()
+    }
+
+    func exported(self) -> int {
+        #- Spans exported successfully. -#
+        return self.queue.exported()
+    }
+
+    func failed(self) -> int {
+        #- Spans whose export failed. -#
+        return self.queue.failed()
+    }
+
+    func lastError(self) -> str {
+        #- The most recent export error (``""`` if none). -#
+        return self.queue.lastErrorText()
+    }
+}
+
+class OtelTracerProvider {
+    #- Owns the tracing pipeline: resource, sampler, span limits and span
+    processors. ``tracer(name, version)`` returns the (cached) tracer for
+    an instrumentation scope. Call ``shutdown()`` before the process exits
+    so buffered spans are exported. -#
+
+    func init(self, resource: OtelResource = None, sampler: OtelSampler = None, limits: OtelSpanLimits = None) {
+        self.resource: OtelResource = resource if resource != None else OtelResource.sdkDefaults()
+        self.sampler: OtelSampler = sampler if sampler != None else OtelSampler.parentBased(OtelSampler.alwaysOn())
+        self.limits: OtelSpanLimits = limits if limits != None else OtelSpanLimits()
+        self.processors: list[OtelSpanProcessor] = []
+        self.tracers: dict[str, OtelTracer] = {}
+        self.enabled: bool = true
+        self.stopped: bool = false
+        self.config: OtelConfig = None
+        self.lock: Mutex = Mutex()
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelTracerProvider {
+        #- A provider for ``cfg``: resource, sampler and limits from the
+        configuration and, per ``OTEL_TRACES_EXPORTER``, a batch processor
+        with the OTLP exporter (``otlp``, default), a simple processor with
+        the console exporter (``console``) or no processor (``none``).
+        ``OTEL_SDK_DISABLED=true`` gives a provider whose spans never record. -#
+        p: OtelTracerProvider = OtelTracerProvider(cfg.resource(), OtelSampler.fromConfig(cfg.sampler, cfg.samplerArg), OtelSpanLimits.fromConfig(cfg))
+        p.config = cfg
+        if cfg.disabled {
+            p.enabled = false
+            return p
+        }
+        for name in cfg.exporterFor("traces").split(",") {
+            n: str = name.trim()
+            if n == "otlp" {
+                p.addProcessor(OtelBatchSpanProcessor.fromConfig(OtelOtlpSpanExporter(cfg), cfg))
+            } elif n == "console" {
+                p.addProcessor(OtelSimpleSpanProcessor(OtelConsoleSpanExporter()))
+            }
+        }
+        return p
+    }
+
+    static func fromEnv() -> OtelTracerProvider {
+        #- ``fromConfig(OtelConfig.fromEnv())``. -#
+        return OtelTracerProvider.fromConfig(OtelConfig.fromEnv())
+    }
+
+    static func noop() -> OtelTracerProvider {
+        #- A provider whose spans propagate context but never record. -#
+        p: OtelTracerProvider = OtelTracerProvider()
+        p.enabled = false
+        return p
+    }
+
+    func addProcessor(self, processor: OtelSpanProcessor) {
+        #- Register a span processor (affects spans started afterwards). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.processors.append(processor)
+    }
+
+    func processorList(self) -> list[OtelSpanProcessor] {
+        #- A copy of the registered processors. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        out: list[OtelSpanProcessor] = []
+        for p in self.processors {
+            out.append(p)
+        }
+        return out
+    }
+
+    func tracer(self, name: str = "", version: str = "") -> OtelTracer {
+        #- The tracer for instrumentation scope ``name``/``version``. -#
+        key: str = name + "@" + version
+        self.lock.lock()
+        defer self.lock.unlock()
+        if key in self.tracers {
+            return self.tracers[key]
+        }
+        t: OtelTracer = OtelTracer(self, name, version)
+        self.tracers[key] = t
+        return t
+    }
+
+    func isShutdown(self) -> bool {
+        #- True after ``shutdown()``. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.stopped
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Flush every processor; the first error is returned after all ran. -#
+        failure: any = None
+        for p in self.processorList() {
+            res: Result[bool] = p.forceFlush()
+            if not res.ok() and failure == None {
+                failure = res.error
+            }
+        }
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Shut every processor down (flushing them). Spans started later do
+        not record. Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        self.lock.unlock()
+        failure: any = None
+        for p in self.processorList() {
+            res: Result[bool] = p.shutdown()
+            if not res.ok() and failure == None {
+                failure = res.error
+            }
+        }
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+}
+
+class OtelTracer {
+    #- Creates spans for one instrumentation scope. Obtain it from
+    ``OtelTracerProvider.tracer(...)``, ``Otel.tracer(...)`` or the
+    ``fromEnv``/``fromConfig`` shortcuts. -#
+
+    func init(self, provider: OtelTracerProvider, name: str = "", version: str = "") {
+        self.provider: OtelTracerProvider = provider
+        self.name: str = name if name != "" else OtelSdkName
+        self.version: str = version if name != "" else OtelSdkVersion
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelTracer {
+        #- A tracer of a new ``OtelTracerProvider.fromConfig(cfg)``. -#
+        return OtelTracerProvider.fromConfig(cfg).tracer()
+    }
+
+    static func fromEnv() -> OtelTracer {
+        #- A tracer of a new ``OtelTracerProvider.fromEnv()``. -#
+        return OtelTracerProvider.fromEnv().tracer()
+    }
+
+    func startSpan(self, name: str, kind: int = 1, parent: OtelSpanContext = None, attributes: dict[str, any] = {}, links: list[OtelSpanLink] = [], startTimeUnixNano: int = 0) -> OtelSpan {
+        #- Start a span. With a valid ``parent`` the span joins its trace
+        (and inherits its ``tracestate``), otherwise it starts a new trace.
+        ``attributes`` and ``links`` are visible to the sampler. -#
+        p: OtelSpanContext = parent if parent != None else OtelSpanContext.invalid()
+        hasParent: bool = p.isValid()
+        traceId: str = p.traceId if hasParent else OtelUtil.traceId()
+        span: OtelSpan = OtelSpan(name, kind, traceId, OtelUtil.spanId())
+        if startTimeUnixNano > 0 {
+            span.startTimeUnixNano = startTimeUnixNano
+        }
+        if hasParent {
+            span.parentSpanId = p.spanId
+            span.parentRemote = p.remote
+            span.traceState = p.traceState
+        }
+        span.resource = self.provider.resource
+        span.scopeName = self.name
+        span.scopeVersion = self.version
+        span.limits = self.provider.limits
+        decision: int = OtelSamplingDecision.DROP
+        if self.provider.enabled and not self.provider.isShutdown() {
+            decision = self.provider.sampler.shouldSample(p, traceId, name, kind, attributes)
+        }
+        span.traceFlags = 1 if decision == OtelSamplingDecision.RECORD_AND_SAMPLE else 0
+        span.recording = decision != OtelSamplingDecision.DROP
+        if not span.recording {
+            return span
+        }
+        span.setAttributes(attributes)
+        for link in links {
+            typedLink: OtelSpanLink = link
+            span.addLink(typedLink.context, typedLink.attributes)
+        }
+        span.processors = self.provider.processorList()
+        for proc in span.processors {
+            proc.onStart(span)
+        }
+        return span
+    }
+
+    func childSpan(self, parent: OtelSpan, name: str, kind: int = 1, attributes: dict[str, any] = {}) -> OtelSpan {
+        #- Start a span whose parent is the local span ``parent``. -#
+        if parent == None {
+            return self.startSpan(name, kind, None, attributes)
+        }
+        return self.startSpan(name, kind, parent.spanContext(), attributes)
+    }
+
+    func startSpanFromHeaders(self, name: str, headers: dict[str, str], kind: int = 2, attributes: dict[str, any] = {}) -> OtelSpan {
+        #- Start a (by default ``SERVER``) span continuing the trace carried
+        by the W3C headers of an incoming request; a missing or malformed
+        ``traceparent`` starts a new trace. -#
+        return self.startSpan(name, kind, OtelTraceContext.extract(headers), attributes)
+    }
+
+    func withSpan(self, name: str, fn: func(OtelSpan), kind: int = 1, parent: OtelSpanContext = None) {
+        #- Run ``fn`` inside a new span that is ended afterwards, also when
+        ``fn`` throws (the exception is recorded, the status set to
+        ``ERROR``, and the exception re-raised). -#
+        span: OtelSpan = self.startSpan(name, kind, parent)
+        try {
+            fn(span)
+        } catch e {
+            span.fail(str(e))
+            span.end()
+            raise
+        }
+        span.end()
+    }
+
+    func batch(self) -> OtelSpanBatch {
+        #- An empty ``OtelSpanBatch`` for manual export. -#
+        return OtelSpanBatch()
+    }
+
+    func exportSpan(self, span: OtelSpan) -> Result[OtelExportResult] {
+        #- Export one span immediately with an OTLP exporter for the
+        provider's configuration (bypassing the processors). -#
+        spans: list[OtelSpan] = [span]
+        return self.exportSpans(spans)
+    }
+
+    func exportSpans(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        #- Export ``spans`` immediately with an OTLP exporter for the
+        provider's configuration (``OtelConfigError`` when the provider was
+        not built from a configuration). -#
+        cfg: OtelConfig = self.provider.config
+        if cfg == None {
+            return Result.Err(Error("OtelConfigError", "the tracer provider has no OtelConfig; use OtelTracerProvider.fromConfig", None))
+        }
+        exporter: OtelOtlpSpanExporter = OtelOtlpSpanExporter(cfg)
+        return exporter.export(spans)
+    }
+}
+
+class OtelSpanBatch {
+    #- A list of spans exported together with ``export(tracer)``. -#
+
+    func init(self) {
+        self.spans: list[OtelSpan] = []
+    }
+
+    func add(self, span: OtelSpan) {
+        #- Append ``span``. -#
+        self.spans.append(span)
+    }
+
+    func size(self) -> int {
+        #- Number of spans. -#
+        return len(self.spans)
+    }
+
+    func export(self, tracer: OtelTracer) -> Result[OtelExportResult] {
+        #- ``tracer.exportSpans(spans)``. -#
+        return tracer.exportSpans(self.spans)
+    }
+}
+
+func main() {
+    pass
+}

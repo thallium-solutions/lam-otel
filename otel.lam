@@ -1,0 +1,259 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result
+from .core import OtelUtil, OtelResource, OtelConfig
+from .trace import OtelSpanContext, OtelBaggage, OtelPropagator, OtelSpan, OtelTraceJson, OtelTracerProvider, OtelTracer
+from .metrics import OtelMetricData, OtelMetricJson, OtelMeter, OtelMeterProvider
+from .logs import OtelLogRecord, OtelLogJson, OtelLoggerProvider, OtelLogger
+
+# ---------------------------------------------------------------------------
+# Facade
+# ---------------------------------------------------------------------------
+
+class OtelSdk {
+    #- The three providers built from one configuration by ``Otel.setup``. -#
+
+    func init(self, config: OtelConfig, tracerProvider: OtelTracerProvider, meterProvider: OtelMeterProvider, loggerProvider: OtelLoggerProvider) {
+        self.config: OtelConfig = config
+        self.tracerProvider: OtelTracerProvider = tracerProvider
+        self.meterProvider: OtelMeterProvider = meterProvider
+        self.loggerProvider: OtelLoggerProvider = loggerProvider
+        self.propagator: OtelPropagator = OtelPropagator.fromConfig(config)
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelSdk {
+        #- Build tracer, meter and logger providers for ``cfg``. -#
+        return OtelSdk(cfg, OtelTracerProvider.fromConfig(cfg), OtelMeterProvider.fromConfig(cfg), OtelLoggerProvider.fromConfig(cfg))
+    }
+
+    func tracer(self, name: str = "", version: str = "") -> OtelTracer {
+        #- ``tracerProvider.tracer(name, version)``. -#
+        return self.tracerProvider.tracer(name, version)
+    }
+
+    func meter(self, name: str = "", version: str = "") -> OtelMeter {
+        #- ``meterProvider.meter(name, version)``. -#
+        return self.meterProvider.meter(name, version)
+    }
+
+    func logger(self, name: str = "", version: str = "") -> OtelLogger {
+        #- ``loggerProvider.logger(name, version)``. -#
+        return self.loggerProvider.logger(name, version)
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Flush traces, metrics and logs; the first error is returned. -#
+        a: Result[bool] = self.tracerProvider.forceFlush()
+        b: Result[bool] = self.meterProvider.forceFlush()
+        c: Result[bool] = self.loggerProvider.forceFlush()
+        if not a.ok() {
+            return a
+        }
+        if not b.ok() {
+            return b
+        }
+        return c
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Shut traces, metrics and logs down (flushing them). -#
+        a: Result[bool] = self.tracerProvider.shutdown()
+        b: Result[bool] = self.meterProvider.shutdown()
+        c: Result[bool] = self.loggerProvider.shutdown()
+        if not a.ok() {
+            return a
+        }
+        if not b.ok() {
+            return b
+        }
+        return c
+    }
+}
+
+class Otel {
+    #- Process-wide entry points: global providers and propagator, ID and
+    header helpers, and OTLP payload builders. Until ``setup``/``set*`` is
+    called the global providers are no-ops, so instrumented libraries can
+    call ``Otel.tracer(...)`` unconditionally. -#
+
+    private static globalTracerProvider: OtelTracerProvider
+    private static globalMeterProvider: OtelMeterProvider
+    private static globalLoggerProvider: OtelLoggerProvider
+    private static globalPropagator: OtelPropagator
+    private static globalSdk: OtelSdk
+
+    static func setup(cfg: OtelConfig = None) -> OtelSdk {
+        #- Build the providers for ``cfg`` (``OtelConfig.fromEnv()`` when
+        omitted), install them and the configured propagator globally, and
+        return them. Call ``Otel.shutdown()`` before exiting. -#
+        c: OtelConfig = cfg if cfg != None else OtelConfig.fromEnv()
+        sdk: OtelSdk = OtelSdk.fromConfig(c)
+        Otel.globalSdk = sdk
+        Otel.globalTracerProvider = sdk.tracerProvider
+        Otel.globalMeterProvider = sdk.meterProvider
+        Otel.globalLoggerProvider = sdk.loggerProvider
+        Otel.globalPropagator = sdk.propagator
+        return sdk
+    }
+
+    static func shutdown() -> Result[bool] {
+        #- Shut the global providers down (flushing them). -#
+        a: Result[bool] = Otel.tracerProvider().shutdown()
+        b: Result[bool] = Otel.meterProvider().shutdown()
+        c: Result[bool] = Otel.loggerProvider().shutdown()
+        if not a.ok() {
+            return a
+        }
+        if not b.ok() {
+            return b
+        }
+        return c
+    }
+
+    static func forceFlush() -> Result[bool] {
+        #- Flush the global providers. -#
+        a: Result[bool] = Otel.tracerProvider().forceFlush()
+        b: Result[bool] = Otel.meterProvider().forceFlush()
+        c: Result[bool] = Otel.loggerProvider().forceFlush()
+        if not a.ok() {
+            return a
+        }
+        if not b.ok() {
+            return b
+        }
+        return c
+    }
+
+    static func setTracerProvider(provider: OtelTracerProvider) {
+        #- Install the global tracer provider. -#
+        Otel.globalTracerProvider = provider
+    }
+
+    static func tracerProvider() -> OtelTracerProvider {
+        #- The global tracer provider (a no-op provider until set). -#
+        if Otel.globalTracerProvider == None {
+            Otel.globalTracerProvider = OtelTracerProvider.noop()
+        }
+        return Otel.globalTracerProvider
+    }
+
+    static func tracer(name: str = "", version: str = "") -> OtelTracer {
+        #- A tracer of the global tracer provider. -#
+        return Otel.tracerProvider().tracer(name, version)
+    }
+
+    static func setMeterProvider(provider: OtelMeterProvider) {
+        #- Install the global meter provider. -#
+        Otel.globalMeterProvider = provider
+    }
+
+    static func meterProvider() -> OtelMeterProvider {
+        #- The global meter provider (a no-op provider until set). -#
+        if Otel.globalMeterProvider == None {
+            Otel.globalMeterProvider = OtelMeterProvider.noop()
+        }
+        return Otel.globalMeterProvider
+    }
+
+    static func meter(name: str = "", version: str = "") -> OtelMeter {
+        #- A meter of the global meter provider. -#
+        return Otel.meterProvider().meter(name, version)
+    }
+
+    static func setLoggerProvider(provider: OtelLoggerProvider) {
+        #- Install the global logger provider. -#
+        Otel.globalLoggerProvider = provider
+    }
+
+    static func loggerProvider() -> OtelLoggerProvider {
+        #- The global logger provider (a no-op provider until set). -#
+        if Otel.globalLoggerProvider == None {
+            Otel.globalLoggerProvider = OtelLoggerProvider.noop()
+        }
+        return Otel.globalLoggerProvider
+    }
+
+    static func logger(name: str = "", version: str = "") -> OtelLogger {
+        #- A logger of the global logger provider. -#
+        return Otel.loggerProvider().logger(name, version)
+    }
+
+    static func setPropagator(propagator: OtelPropagator) {
+        #- Install the global propagator. -#
+        Otel.globalPropagator = propagator
+    }
+
+    static func propagator() -> OtelPropagator {
+        #- The global propagator (``tracecontext,baggage`` until set). -#
+        if Otel.globalPropagator == None {
+            Otel.globalPropagator = OtelPropagator()
+        }
+        return Otel.globalPropagator
+    }
+
+    static func inject(headers: dict[str, str], context: OtelSpanContext, baggage: OtelBaggage = None) {
+        #- Write the propagation headers for ``context``/``baggage`` with
+        the global propagator. -#
+        Otel.propagator().inject(headers, context, baggage)
+    }
+
+    static func extract(headers: dict[str, str]) -> OtelSpanContext {
+        #- The remote span context of incoming ``headers``. -#
+        return Otel.propagator().extract(headers)
+    }
+
+    static func extractBaggage(headers: dict[str, str]) -> OtelBaggage {
+        #- The baggage of incoming ``headers``. -#
+        return Otel.propagator().extractBaggage(headers)
+    }
+
+    static func traceId() -> str {
+        #- A new random trace id (32 lowercase hex characters). -#
+        return OtelUtil.traceId()
+    }
+
+    static func spanId() -> str {
+        #- A new random span id (16 lowercase hex characters). -#
+        return OtelUtil.spanId()
+    }
+
+    static func idsTrace() -> str {
+        #- Alias of ``traceId()`` kept from ``lamotel``. -#
+        return OtelUtil.traceId()
+    }
+
+    static func idsSpan() -> str {
+        #- Alias of ``spanId()`` kept from ``lamotel``. -#
+        return OtelUtil.spanId()
+    }
+
+    static func parsePairs(text: str) -> dict[str, str] {
+        #- Parse a ``key=value,key2=value2`` list (percent-decoded values). -#
+        return OtelUtil.parsePairs(text)
+    }
+
+    static func parseHeaders(text: str) -> dict[str, str] {
+        #- Parse an ``OTEL_EXPORTER_OTLP_HEADERS`` value. -#
+        return OtelUtil.parsePairs(text)
+    }
+
+    static func tracesPayload(spans: list[OtelSpan]) -> json {
+        #- The OTLP/JSON traces request for ``spans``. -#
+        return OtelTraceJson.payload(spans)
+    }
+
+    static func metricsPayload(resource: OtelResource, metrics: list[OtelMetricData]) -> json {
+        #- The OTLP/JSON metrics request for ``metrics``. -#
+        return OtelMetricJson.payload(resource, metrics)
+    }
+
+    static func logsPayload(records: list[OtelLogRecord]) -> json {
+        #- The OTLP/JSON logs request for ``records``. -#
+        return OtelLogJson.payload(records)
+    }
+}
+
+func main() {
+    pass
+}

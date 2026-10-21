@@ -1,0 +1,1061 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconcurrency import Mutex
+from lamerrors import Result, Error
+from lamjson import Json
+from lamtime import Time
+from .core import OtelSdkName, OtelSdkVersion, OtelUtil, OtelResource, OtelConfig, OtelExportResult, OtelOtlpHttp, OtelWorker, otelCallWithTimeout
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+class OtelMetricPoint {
+    #- One data point of a metric stream (one attribute set). Sums and
+    gauges use ``intValue`` or ``doubleValue`` (``isDouble``); histograms
+    use ``count``, ``sum``, ``min``, ``max``, ``bucketCounts`` and
+    ``explicitBounds``. Times are Unix nanoseconds. -#
+
+    func init(self, attributes: dict[str, any] = {}) {
+        self.attributes: dict[str, any] = OtelUtil.copyAttributes(attributes)
+        self.startTimeUnixNano: int = 0
+        self.timeUnixNano: int = 0
+        self.isDouble: bool = false
+        self.intValue: int = 0
+        self.doubleValue: float = 0.0
+        self.count: int = 0
+        self.sum: float = 0.0
+        self.min: float = 0.0
+        self.max: float = 0.0
+        self.bucketCounts: list[int] = []
+        self.explicitBounds: list[float] = []
+    }
+
+    func value(self) -> float {
+        #- The sum/gauge value as a float. -#
+        if self.isDouble {
+            return self.doubleValue
+        }
+        return float(self.intValue)
+    }
+
+    func copy(self) -> OtelMetricPoint {
+        #- An independent snapshot of this point. -#
+        out: OtelMetricPoint = OtelMetricPoint(self.attributes)
+        out.startTimeUnixNano = self.startTimeUnixNano
+        out.timeUnixNano = self.timeUnixNano
+        out.isDouble = self.isDouble
+        out.intValue = self.intValue
+        out.doubleValue = self.doubleValue
+        out.count = self.count
+        out.sum = self.sum
+        out.min = self.min
+        out.max = self.max
+        for c in self.bucketCounts {
+            out.bucketCounts.append(c)
+        }
+        for b in self.explicitBounds {
+            out.explicitBounds.append(b)
+        }
+        return out
+    }
+
+    func toJson(self, kind: str) -> json {
+        #- The OTLP/JSON data point for a ``"sum"``, ``"gauge"`` or
+        ``"histogram"`` metric. -#
+        out: json = {
+            "attributes": OtelUtil.attributesJson(self.attributes),
+            "timeUnixNano": str(self.timeUnixNano),
+        }
+        if kind != "gauge" {
+            out["startTimeUnixNano"] = str(self.startTimeUnixNano)
+        }
+        if kind == "histogram" {
+            buckets: list[json] = []
+            for c in self.bucketCounts {
+                buckets.append(str(c))
+            }
+            bounds: list[json] = []
+            for b in self.explicitBounds {
+                bounds.append(b)
+            }
+            out["count"] = str(self.count)
+            out["sum"] = self.sum
+            out["bucketCounts"] = buckets
+            out["explicitBounds"] = bounds
+            if self.count > 0 {
+                out["min"] = self.min
+                out["max"] = self.max
+            }
+            return out
+        }
+        if self.isDouble {
+            out["asDouble"] = self.doubleValue
+        } else {
+            out["asInt"] = str(self.intValue)
+        }
+        return out
+    }
+}
+
+class OtelMetricData {
+    #- A collected metric: identity (``name``, ``unit``, ``description``,
+    instrumentation scope), ``kind`` (``"sum"``, ``"gauge"`` or
+    ``"histogram"``), ``monotonic`` for sums, cumulative temporality, and
+    one ``OtelMetricPoint`` per attribute set. -#
+
+    static TEMPORALITY_DELTA: int = 1
+    static TEMPORALITY_CUMULATIVE: int = 2
+
+    func init(self, name: str, kind: str, unit: str = "", description: str = "") {
+        self.name: str = name
+        self.kind: str = kind
+        self.unit: str = unit
+        self.description: str = description
+        self.monotonic: bool = false
+        self.temporality: int = 2
+        self.scopeName: str = OtelSdkName
+        self.scopeVersion: str = OtelSdkVersion
+        self.points: list[OtelMetricPoint] = []
+    }
+
+    func point(self, attributes: dict[str, any] = {}) -> OtelMetricPoint {
+        #- The point for exactly ``attributes`` (``None`` when absent). -#
+        key: str = OtelUtil.attributeKey(attributes)
+        for p in self.points {
+            if OtelUtil.attributeKey(p.attributes) == key {
+                return p
+            }
+        }
+        return None
+    }
+
+    func toJson(self) -> json {
+        #- The OTLP/JSON ``Metric`` message. -#
+        points: list[json] = []
+        for p in self.points {
+            points.append(p.toJson(self.kind))
+        }
+        out: json = {"name": self.name, "description": self.description, "unit": self.unit}
+        if self.kind == "sum" {
+            out["sum"] = {"dataPoints": points, "aggregationTemporality": self.temporality, "isMonotonic": self.monotonic}
+        } elif self.kind == "histogram" {
+            out["histogram"] = {"dataPoints": points, "aggregationTemporality": self.temporality}
+        } else {
+            out["gauge"] = {"dataPoints": points}
+        }
+        return out
+    }
+}
+
+class OtelMetricJson {
+    #- OTLP/JSON encoding of metrics (``ExportMetricsServiceRequest``). -#
+
+    static func payload(resource: OtelResource, metrics: list[OtelMetricData]) -> json {
+        #- Group ``metrics`` by instrumentation scope under ``resource``. -#
+        order: list[str] = []
+        grouped: dict[str, list[json]] = {}
+        names: dict[str, str] = {}
+        versions: dict[str, str] = {}
+        for item in metrics {
+            m: OtelMetricData = item
+            key: str = m.scopeName + "\x1d" + m.scopeVersion
+            if key not in grouped {
+                grouped[key] = []
+                names[key] = m.scopeName
+                versions[key] = m.scopeVersion
+                order.append(key)
+            }
+            encoded: list[json] = grouped[key]
+            encoded.append(m.toJson())
+            grouped[key] = encoded
+        }
+        scopes: list[json] = []
+        for key in order {
+            scopes.append({"scope": {"name": names[key], "version": versions[key]}, "metrics": grouped[key]})
+        }
+        res: OtelResource = resource if resource != None else OtelResource.sdkDefaults()
+        return {"resourceMetrics": [{"resource": res.toJson(), "scopeMetrics": scopes}]}
+    }
+}
+
+class OtelInstrument {
+    #- Shared state of a synchronous instrument: one aggregated point per
+    attribute set (cumulative since the meter provider started). Use the
+    typed subclasses (``OtelCounter``, ``OtelUpDownCounter``,
+    ``OtelGauge``, ``OtelHistogram``). Recording is goroutine-safe. -#
+
+    func init(self, meter: OtelMeter, name: str, kind: str, unit: str = "", description: str = "", monotonic: bool = false, bounds: list[float] = []) {
+        self.meter: OtelMeter = meter
+        self.name: str = name
+        self.kind: str = kind
+        self.unit: str = unit
+        self.description: str = description
+        self.monotonic: bool = monotonic
+        self.bounds: list[float] = []
+        for b in bounds {
+            self.bounds.append(b)
+        }
+        self.enabled: bool = OtelMeter.validName(name)
+        self.points: dict[str, OtelMetricPoint] = {}
+        self.order: list[str] = []
+        self.lock: Mutex = Mutex()
+    }
+
+    private func _point(self, attributes: dict[str, any]) -> OtelMetricPoint {
+        # Caller holds the lock.
+        key: str = OtelUtil.attributeKey(attributes)
+        if key in self.points {
+            return self.points[key]
+        }
+        attrs: dict[str, any] = attributes
+        limit: int = self.meter.provider.cardinalityLimit
+        if limit > 0 and len(self.points) >= limit - 1 {
+            attrs = {"otel.metric.overflow": true}
+            key = OtelUtil.attributeKey(attrs)
+            if key in self.points {
+                return self.points[key]
+            }
+        }
+        p: OtelMetricPoint = OtelMetricPoint(attrs)
+        p.startTimeUnixNano = self.meter.provider.startTimeUnixNano
+        if self.kind == "histogram" {
+            for b in self.bounds {
+                p.explicitBounds.append(b)
+                p.bucketCounts.append(0)
+            }
+            p.bucketCounts.append(0)
+        }
+        self.points[key] = p
+        self.order.append(key)
+        return p
+    }
+
+    func _clear(self) {
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.points = {}
+        self.order = []
+    }
+
+    private func _active(self) -> bool {
+        return self.enabled and self.meter.provider.enabled and not self.meter.provider.isShutdown()
+    }
+
+    func _addInt(self, value: int, attributes: dict[str, any]) {
+        if not self._active() {
+            return
+        }
+        if self.monotonic and value < 0 {
+            return
+        }
+        self.lock.lock()
+        defer self.lock.unlock()
+        p: OtelMetricPoint = self._point(attributes)
+        if p.isDouble {
+            p.doubleValue = p.doubleValue + float(value)
+        } else {
+            p.intValue = p.intValue + value
+        }
+        p.timeUnixNano = Time.nowUnixNano()
+    }
+
+    func _addFloat(self, value: float, attributes: dict[str, any]) {
+        if not self._active() {
+            return
+        }
+        if self.monotonic and value < 0.0 {
+            return
+        }
+        self.lock.lock()
+        defer self.lock.unlock()
+        p: OtelMetricPoint = self._point(attributes)
+        if not p.isDouble {
+            p.isDouble = true
+            p.doubleValue = float(p.intValue)
+        }
+        p.doubleValue = p.doubleValue + value
+        p.timeUnixNano = Time.nowUnixNano()
+    }
+
+    func _setInt(self, value: int, attributes: dict[str, any]) {
+        if not self._active() {
+            return
+        }
+        self.lock.lock()
+        defer self.lock.unlock()
+        p: OtelMetricPoint = self._point(attributes)
+        p.isDouble = false
+        p.intValue = value
+        p.timeUnixNano = Time.nowUnixNano()
+    }
+
+    func _setFloat(self, value: float, attributes: dict[str, any]) {
+        if not self._active() {
+            return
+        }
+        self.lock.lock()
+        defer self.lock.unlock()
+        p: OtelMetricPoint = self._point(attributes)
+        p.isDouble = true
+        p.doubleValue = value
+        p.timeUnixNano = Time.nowUnixNano()
+    }
+
+    func _observe(self, value: float, attributes: dict[str, any]) {
+        if not self._active() {
+            return
+        }
+        self.lock.lock()
+        defer self.lock.unlock()
+        p: OtelMetricPoint = self._point(attributes)
+        idx: int = 0
+        for b in self.bounds {
+            if value <= b {
+                break
+            }
+            idx += 1
+        }
+        p.bucketCounts[idx] = p.bucketCounts[idx] + 1
+        if p.count == 0 or value < p.min {
+            p.min = value
+        }
+        if p.count == 0 or value > p.max {
+            p.max = value
+        }
+        p.count += 1
+        p.sum = p.sum + value
+        p.timeUnixNano = Time.nowUnixNano()
+    }
+
+    func collect(self, nowUnixNano: int) -> OtelMetricData {
+        #- Snapshot every point (``None`` when nothing was recorded). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if len(self.order) == 0 {
+            return None
+        }
+        data: OtelMetricData = OtelMetricData(self.name, self.kind, self.unit, self.description)
+        data.monotonic = self.monotonic
+        data.scopeName = self.meter.name
+        data.scopeVersion = self.meter.version
+        for key in self.order {
+            p: OtelMetricPoint = self.points[key].copy()
+            p.timeUnixNano = nowUnixNano
+            data.points.append(p)
+        }
+        return data
+    }
+}
+
+class OtelCounter(OtelInstrument) {
+    #- A monotonic sum (requests served, bytes sent). Negative increments
+    are ignored. Exported as a cumulative, monotonic OTLP ``Sum``. -#
+
+    func add(self, value: int, attributes: dict[str, any] = {}) {
+        #- Add a non-negative integer increment for ``attributes``. -#
+        self._addInt(value, attributes)
+    }
+
+    func addFloat(self, value: float, attributes: dict[str, any] = {}) {
+        #- Add a non-negative float increment (the stream becomes
+        ``asDouble``). -#
+        self._addFloat(value, attributes)
+    }
+}
+
+class OtelUpDownCounter(OtelInstrument) {
+    #- A sum that can go up and down (queue length, active requests).
+    Exported as a cumulative, non-monotonic OTLP ``Sum``. -#
+
+    func add(self, value: int, attributes: dict[str, any] = {}) {
+        #- Add a (possibly negative) integer delta for ``attributes``. -#
+        self._addInt(value, attributes)
+    }
+
+    func addFloat(self, value: float, attributes: dict[str, any] = {}) {
+        #- Add a (possibly negative) float delta (the stream becomes
+        ``asDouble``). -#
+        self._addFloat(value, attributes)
+    }
+}
+
+class OtelGauge(OtelInstrument) {
+    #- A synchronous gauge: the last recorded value per attribute set
+    (temperature, configured pool size). Exported as an OTLP ``Gauge``. -#
+
+    func record(self, value: int, attributes: dict[str, any] = {}) {
+        #- Record the current integer value for ``attributes``. -#
+        self._setInt(value, attributes)
+    }
+
+    func recordFloat(self, value: float, attributes: dict[str, any] = {}) {
+        #- Record the current float value for ``attributes``. -#
+        self._setFloat(value, attributes)
+    }
+}
+
+class OtelHistogram(OtelInstrument) {
+    #- A distribution of measurements (request durations, payload sizes)
+    aggregated into explicit buckets with count, sum, min and max.
+    Exported as a cumulative OTLP ``Histogram``. -#
+
+    func record(self, value: int, attributes: dict[str, any] = {}) {
+        #- Record an integer measurement for ``attributes``. -#
+        self._observe(float(value), attributes)
+    }
+
+    func recordFloat(self, value: float, attributes: dict[str, any] = {}) {
+        #- Record a float measurement for ``attributes``. -#
+        self._observe(value, attributes)
+    }
+
+    func boundaries(self) -> list[float] {
+        #- The explicit bucket boundaries. -#
+        return self.bounds
+    }
+}
+
+class OtelObservableResult {
+    #- Passed to observable-instrument callbacks to report measurements. -#
+
+    func init(self) {
+        self.ints: list[int] = []
+        self.floats: list[float] = []
+        self.isFloat: list[bool] = []
+        self.attributes: list[dict[str, any]] = []
+    }
+
+    func observe(self, value: int, attributes: dict[str, any] = {}) {
+        #- Report an integer value for ``attributes``. -#
+        self.ints.append(value)
+        self.floats.append(0.0)
+        self.isFloat.append(false)
+        self.attributes.append(OtelUtil.copyAttributes(attributes))
+    }
+
+    func observeFloat(self, value: float, attributes: dict[str, any] = {}) {
+        #- Report a float value for ``attributes``. -#
+        self.ints.append(0)
+        self.floats.append(value)
+        self.isFloat.append(true)
+        self.attributes.append(OtelUtil.copyAttributes(attributes))
+    }
+
+    func size(self) -> int {
+        #- Number of observations. -#
+        return len(self.ints)
+    }
+}
+
+class OtelObservableInstrument(OtelInstrument) {
+    #- An asynchronous instrument whose ``callback`` is invoked on every
+    collection: an observable gauge (current values), counter (monotonic
+    cumulative totals) or up-down counter (cumulative totals). The
+    observed values replace the previous ones; attribute sets that are not
+    observed again are not exported. -#
+
+    callbackFn: func(OtelObservableResult) = None
+
+    func setCallback(self, callback: func(OtelObservableResult)) {
+        #- Install the callback (called with the instrument unlocked). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.callbackFn = callback
+    }
+
+    func collect(self, nowUnixNano: int) -> OtelMetricData {
+        #- Run the callback and snapshot its observations. -#
+        if not self._active() {
+            return None
+        }
+        self.lock.lock()
+        callback: func(OtelObservableResult) = self.callbackFn
+        self.lock.unlock()
+        if callback == None {
+            return None
+        }
+        result: OtelObservableResult = OtelObservableResult()
+        try {
+            callback(result)
+        } catch e {
+            _ = e
+            return None
+        }
+        self._clear()
+        i: int = 0
+        while i < result.size() {
+            if result.isFloat[i] {
+                self._setFloat(result.floats[i], result.attributes[i])
+            } else {
+                self._setInt(result.ints[i], result.attributes[i])
+            }
+            i += 1
+        }
+        return base.collect(nowUnixNano)
+    }
+}
+
+class OtelMeter {
+    #- Creates instruments for one instrumentation scope. Asking twice for
+    the same instrument name and kind returns the same instrument. Names
+    must match ``[A-Za-z][A-Za-z0-9_./-]{0,254}``; instruments with an
+    invalid name ignore their measurements. -#
+
+    static DEFAULT_BOUNDS: list[float] = [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0]
+
+    func init(self, provider: OtelMeterProvider, name: str = "", version: str = "") {
+        self.provider: OtelMeterProvider = provider
+        self.name: str = name if name != "" else OtelSdkName
+        self.version: str = version if name != "" else OtelSdkVersion
+        self.instruments: list[OtelInstrument] = []
+        self.counters: dict[str, OtelCounter] = {}
+        self.upDownCounters: dict[str, OtelUpDownCounter] = {}
+        self.gauges: dict[str, OtelGauge] = {}
+        self.histograms: dict[str, OtelHistogram] = {}
+        self.observables: dict[str, OtelObservableInstrument] = {}
+        self.lock: Mutex = Mutex()
+    }
+
+    static func validName(name: str) -> bool {
+        #- True for a valid instrument name. -#
+        if len(name) == 0 or len(name) > 255 {
+            return false
+        }
+        first: bool = true
+        for ch in name {
+            if first {
+                if not ch.isAlpha() {
+                    return false
+                }
+                first = false
+            } elif not (ch.isAlnum() or ch == "_" or ch == "." or ch == "/" or ch == "-") {
+                return false
+            }
+        }
+        return true
+    }
+
+    func counter(self, name: str, unit: str = "", description: str = "") -> OtelCounter {
+        #- A monotonic counter. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if name in self.counters {
+            return self.counters[name]
+        }
+        c: OtelCounter = OtelCounter(self, name, "sum", unit, description, true)
+        self.counters[name] = c
+        self.instruments.append(c)
+        return c
+    }
+
+    func upDownCounter(self, name: str, unit: str = "", description: str = "") -> OtelUpDownCounter {
+        #- An up-down counter. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if name in self.upDownCounters {
+            return self.upDownCounters[name]
+        }
+        c: OtelUpDownCounter = OtelUpDownCounter(self, name, "sum", unit, description, false)
+        self.upDownCounters[name] = c
+        self.instruments.append(c)
+        return c
+    }
+
+    func gauge(self, name: str, unit: str = "", description: str = "") -> OtelGauge {
+        #- A synchronous gauge. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if name in self.gauges {
+            return self.gauges[name]
+        }
+        g: OtelGauge = OtelGauge(self, name, "gauge", unit, description, false)
+        self.gauges[name] = g
+        self.instruments.append(g)
+        return g
+    }
+
+    func histogram(self, name: str, unit: str = "", description: str = "", boundaries: list[float] = []) -> OtelHistogram {
+        #- A histogram with explicit bucket ``boundaries`` (ascending; the
+        default is ``OtelMeter.DEFAULT_BOUNDS``, suited to milliseconds). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if name in self.histograms {
+            return self.histograms[name]
+        }
+        bounds: list[float] = boundaries
+        if len(bounds) == 0 {
+            bounds = OtelMeter.DEFAULT_BOUNDS
+        }
+        sortedBounds: list[float] = bounds.sort()
+        h: OtelHistogram = OtelHistogram(self, name, "histogram", unit, description, false, sortedBounds)
+        self.histograms[name] = h
+        self.instruments.append(h)
+        return h
+    }
+
+    private func _observable(self, name: str, kind: str, monotonic: bool, callback: func(OtelObservableResult), unit: str, description: str) -> OtelObservableInstrument {
+        self.lock.lock()
+        defer self.lock.unlock()
+        key: str = kind + ":" + str(monotonic) + ":" + name
+        if key in self.observables {
+            existing: OtelObservableInstrument = self.observables[key]
+            existing.setCallback(callback)
+            return existing
+        }
+        o: OtelObservableInstrument = OtelObservableInstrument(self, name, kind, unit, description, monotonic)
+        o.setCallback(callback)
+        self.observables[key] = o
+        self.instruments.append(o)
+        return o
+    }
+
+    func observableGauge(self, name: str, callback: func(OtelObservableResult), unit: str = "", description: str = "") -> OtelObservableInstrument {
+        #- A gauge observed by ``callback`` at each collection. -#
+        return self._observable(name, "gauge", false, callback, unit, description)
+    }
+
+    func observableCounter(self, name: str, callback: func(OtelObservableResult), unit: str = "", description: str = "") -> OtelObservableInstrument {
+        #- A monotonic sum whose cumulative total is observed by ``callback``. -#
+        return self._observable(name, "sum", true, callback, unit, description)
+    }
+
+    func observableUpDownCounter(self, name: str, callback: func(OtelObservableResult), unit: str = "", description: str = "") -> OtelObservableInstrument {
+        #- A non-monotonic sum whose total is observed by ``callback``. -#
+        return self._observable(name, "sum", false, callback, unit, description)
+    }
+
+    func collect(self, nowUnixNano: int) -> list[OtelMetricData] {
+        #- Snapshot every instrument that has data. -#
+        self.lock.lock()
+        instruments: list[OtelInstrument] = []
+        for i in self.instruments {
+            instruments.append(i)
+        }
+        self.lock.unlock()
+        out: list[OtelMetricData] = []
+        for item in instruments {
+            instrument: OtelInstrument = item
+            data: OtelMetricData = instrument.collect(nowUnixNano)
+            if data != None {
+                out.append(data)
+            }
+        }
+        return out
+    }
+}
+
+interface OtelMetricExporter {
+    #- Destination for collected metrics: ``export`` receives the
+    provider's resource and one cumulative snapshot of every metric;
+    ``shutdown`` releases resources. -#
+    func export(self, resource: OtelResource, metrics: list[OtelMetricData]) -> Result[OtelExportResult]
+    func shutdown(self) -> Result[bool]
+}
+
+class OtelOtlpMetricExporter {
+    #- Exports metrics as OTLP/HTTP JSON to ``metricsUrl()`` of the
+    configuration (headers, timeout, compression, retries). -#
+
+    func init(self, cfg: OtelConfig = None) {
+        c: OtelConfig = cfg if cfg != None else OtelConfig.fromEnv()
+        self.transport: OtelOtlpHttp = OtelOtlpHttp.forSignal(c, "metrics")
+        self.stopped: bool = false
+    }
+
+    func export(self, resource: OtelResource, metrics: list[OtelMetricData]) -> Result[OtelExportResult] {
+        #- POST ``metrics`` (nothing is sent for an empty list). -#
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "metric exporter is shut down", None))
+        }
+        if len(metrics) == 0 {
+            return Result.Ok(OtelExportResult(0, "", 0, 0))
+        }
+        points: int = 0
+        for m in metrics {
+            points += len(m.points)
+        }
+        return self.transport.send(OtelMetricJson.payload(resource, metrics), points)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports. -#
+        self.stopped = true
+        return Result.Ok(true)
+    }
+}
+
+class OtelInMemoryMetricExporter {
+    #- Keeps every exported metric batch in memory: the exporter to use
+    in tests. -#
+
+    func init(self) {
+        self.batches: list[list[OtelMetricData]] = []
+        self.resource: OtelResource = None
+        self.stopped: bool = false
+        self.lock: Mutex = Mutex()
+    }
+
+    func export(self, resource: OtelResource, metrics: list[OtelMetricData]) -> Result[OtelExportResult] {
+        #- Store ``metrics`` as one batch. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "metric exporter is shut down", None))
+        }
+        self.resource = resource
+        self.batches.append(metrics)
+        return Result.Ok(OtelExportResult(0, "", 1, len(metrics)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports (stored batches stay readable). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.stopped = true
+        return Result.Ok(true)
+    }
+
+    func exportCount(self) -> int {
+        #- Number of export calls received. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return len(self.batches)
+    }
+
+    func latest(self) -> list[OtelMetricData] {
+        #- The most recent batch (empty when nothing was exported). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if len(self.batches) == 0 {
+            return []
+        }
+        return self.batches[len(self.batches) - 1]
+    }
+
+    func find(self, name: str) -> OtelMetricData {
+        #- The metric ``name`` in the most recent batch that contains it
+        (``None`` when absent). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        i: int = len(self.batches) - 1
+        while i >= 0 {
+            for m in self.batches[i] {
+                if m.name == name {
+                    return m
+                }
+            }
+            i -= 1
+        }
+        return None
+    }
+
+    func reset(self) {
+        #- Forget the stored batches. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.batches = []
+    }
+}
+
+class OtelConsoleMetricExporter {
+    #- Writes every exported metric as one JSON line (the OTLP metric plus
+    its scope) to standard output, or to ``out`` when given. -#
+
+    func init(self, out: func(str) = None) {
+        self.out: func(str) = out
+        self.stopped: bool = false
+    }
+
+    func export(self, resource: OtelResource, metrics: list[OtelMetricData]) -> Result[OtelExportResult] {
+        #- Write one line per metric. -#
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "metric exporter is shut down", None))
+        }
+        _ = resource
+        for m in metrics {
+            doc: json = {"scope": {"name": m.scopeName, "version": m.scopeVersion}, "metric": m.toJson()}
+            line: str = Json.encode(doc).unwrapOr("{}")
+            if self.out == None {
+                print(line)
+            } else {
+                writer: func(str) = self.out
+                writer(line)
+            }
+        }
+        return Result.Ok(OtelExportResult(0, "", 1, len(metrics)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports. -#
+        self.stopped = true
+        return Result.Ok(true)
+    }
+}
+
+class OtelMetricReader {
+    #- Collects the metrics of its ``OtelMeterProvider`` and exports them:
+    every ``intervalMs`` from a background goroutine (periodic reader,
+    ``OTEL_METRIC_EXPORT_INTERVAL``) and on ``forceFlush()``/``shutdown()``.
+    ``intervalMs <= 0`` makes a manual reader. Each export is bounded by
+    ``timeoutMs``. -#
+
+    func init(self, exporter: OtelMetricExporter, intervalMs: int = 60000, timeoutMs: int = 30000) {
+        self.exporter: OtelMetricExporter = exporter
+        self.intervalMs: int = intervalMs
+        self.timeoutMs: int = timeoutMs
+        self.provider: OtelMeterProvider = None
+        self.worker: OtelWorker = None
+        self.stopped: bool = false
+        self.exportCalls: int = 0
+        self.failedCount: int = 0
+        self.lastError: str = ""
+        self.lock: Mutex = Mutex()
+        self.exportLock: Mutex = Mutex()
+    }
+
+    static func fromConfig(exporter: OtelMetricExporter, cfg: OtelConfig) -> OtelMetricReader {
+        #- A periodic reader using ``OTEL_METRIC_EXPORT_INTERVAL`` and
+        ``OTEL_METRIC_EXPORT_TIMEOUT``. -#
+        return OtelMetricReader(exporter, cfg.metricExportIntervalMs, cfg.metricExportTimeoutMs)
+    }
+
+    func _attach(self, provider: OtelMeterProvider) {
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.provider = provider
+        if self.intervalMs > 0 and self.worker == None {
+            self.worker = OtelWorker(self.intervalMs, self._tick)
+            self.worker.start()
+        }
+    }
+
+    private func _tick(self) {
+        _ = self.forceFlush()
+    }
+
+    func collect(self) -> list[OtelMetricData] {
+        #- The current metrics of the provider (empty when unattached). -#
+        if self.provider == None {
+            return []
+        }
+        return self.provider.collect()
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Collect and export now. -#
+        self.exportLock.lock()
+        defer self.exportLock.unlock()
+        if self.provider == None {
+            return Result.Ok(true)
+        }
+        metrics: list[OtelMetricData] = self.collect()
+        if len(metrics) == 0 {
+            return Result.Ok(true)
+        }
+        exporter: OtelMetricExporter = self.exporter
+        resource: OtelResource = self.provider.resource
+        res: Result[OtelExportResult] = otelCallWithTimeout(self.timeoutMs, lambda: exporter.export(resource, metrics))
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.exportCalls += 1
+        if not res.ok() {
+            self.failedCount += 1
+            self.lastError = str(res.error)
+            return Result.Err(res.error)
+        }
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Stop the background loop, export a final collection and shut the
+        exporter down. Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        worker: OtelWorker = self.worker
+        self.lock.unlock()
+        if worker != None {
+            worker.stop()
+        }
+        flushed: Result[bool] = self.forceFlush()
+        closed: Result[bool] = self.exporter.shutdown()
+        if not flushed.ok() {
+            return flushed
+        }
+        return closed
+    }
+
+    func exports(self) -> int {
+        #- Number of export calls made. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.exportCalls
+    }
+
+    func errorMessage(self) -> str {
+        #- The most recent export error (``""`` if none). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.lastError
+    }
+}
+
+class OtelMeterProvider {
+    #- Owns the metrics pipeline: resource, meters and readers. Metric
+    streams are cumulative from ``startTimeUnixNano``. At most
+    ``cardinalityLimit`` attribute sets are kept per instrument; further
+    sets are folded into one ``otel.metric.overflow=true`` point. -#
+
+    func init(self, resource: OtelResource = None) {
+        self.resource: OtelResource = resource if resource != None else OtelResource.sdkDefaults()
+        self.readers: list[OtelMetricReader] = []
+        self.meters: dict[str, OtelMeter] = {}
+        self.meterOrder: list[OtelMeter] = []
+        self.startTimeUnixNano: int = Time.nowUnixNano()
+        self.cardinalityLimit: int = 2000
+        self.enabled: bool = true
+        self.stopped: bool = false
+        self.config: OtelConfig = None
+        self.lock: Mutex = Mutex()
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelMeterProvider {
+        #- A provider for ``cfg`` with, per ``OTEL_METRICS_EXPORTER``, a
+        periodic reader exporting over OTLP (``otlp``, default) or to the
+        console (``console``), or no reader (``none``). -#
+        p: OtelMeterProvider = OtelMeterProvider(cfg.resource())
+        p.config = cfg
+        if cfg.disabled {
+            p.enabled = false
+            return p
+        }
+        for name in cfg.exporterFor("metrics").split(",") {
+            n: str = name.trim()
+            if n == "otlp" {
+                p.addReader(OtelMetricReader.fromConfig(OtelOtlpMetricExporter(cfg), cfg))
+            } elif n == "console" {
+                p.addReader(OtelMetricReader.fromConfig(OtelConsoleMetricExporter(), cfg))
+            }
+        }
+        return p
+    }
+
+    static func fromEnv() -> OtelMeterProvider {
+        #- ``fromConfig(OtelConfig.fromEnv())``. -#
+        return OtelMeterProvider.fromConfig(OtelConfig.fromEnv())
+    }
+
+    static func noop() -> OtelMeterProvider {
+        #- A provider whose instruments ignore every measurement. -#
+        p: OtelMeterProvider = OtelMeterProvider()
+        p.enabled = false
+        return p
+    }
+
+    func addReader(self, reader: OtelMetricReader) {
+        #- Register a reader (a periodic reader starts its loop now). -#
+        self.lock.lock()
+        self.readers.append(reader)
+        self.lock.unlock()
+        reader._attach(self)
+    }
+
+    func meter(self, name: str = "", version: str = "") -> OtelMeter {
+        #- The meter for instrumentation scope ``name``/``version``. -#
+        key: str = name + "@" + version
+        self.lock.lock()
+        defer self.lock.unlock()
+        if key in self.meters {
+            return self.meters[key]
+        }
+        m: OtelMeter = OtelMeter(self, name, version)
+        self.meters[key] = m
+        self.meterOrder.append(m)
+        return m
+    }
+
+    func isShutdown(self) -> bool {
+        #- True after ``shutdown()``. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.stopped
+    }
+
+    func collect(self) -> list[OtelMetricData] {
+        #- Snapshot every meter. -#
+        self.lock.lock()
+        meters: list[OtelMeter] = []
+        for m in self.meterOrder {
+            meters.append(m)
+        }
+        self.lock.unlock()
+        now: int = Time.nowUnixNano()
+        out: list[OtelMetricData] = []
+        for item in meters {
+            m: OtelMeter = item
+            for data in m.collect(now) {
+                out.append(data)
+            }
+        }
+        return out
+    }
+
+    func _readerList(self) -> list[OtelMetricReader] {
+        self.lock.lock()
+        defer self.lock.unlock()
+        out: list[OtelMetricReader] = []
+        for r in self.readers {
+            out.append(r)
+        }
+        return out
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Collect and export through every reader. -#
+        failure: any = None
+        for r in self._readerList() {
+            res: Result[bool] = r.forceFlush()
+            if not res.ok() and failure == None {
+                failure = res.error
+            }
+        }
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Final export through every reader, then stop recording.
+        Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.lock.unlock()
+        failure: any = None
+        for r in self._readerList() {
+            res: Result[bool] = r.shutdown()
+            if not res.ok() and failure == None {
+                failure = res.error
+            }
+        }
+        self.lock.lock()
+        self.stopped = true
+        self.lock.unlock()
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+}
+
+func main() {
+    pass
+}

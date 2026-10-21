@@ -39,12 +39,12 @@ migration notes.
 
 ## Installation
 
-`@lam/otel` requires `lamc` 2.1 or newer. Add it to the `[dependencies]` of
+`@lam/otel` requires `lamc` 3.0 or newer. Add it to the `[dependencies]` of
 your project's `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/otel" = { git = "https://github.com/thallium-solutions/lam-otel.git", ref = "1.0.0" }
+"@lam/otel" = { git = "https://github.com/thallium-solutions/lam-otel.git", ref = "1.1.0" }
 ```
 
 and install it:
@@ -597,11 +597,6 @@ final `OtelExportResult` or the transport error), `OtelTimeoutError`
   the `context` argument of the logger methods). A
   `lamcontext.Context` can carry a span (`Context.simple().valued("span",
   span)`) when you need to thread it through call chains.
-- **Compiler notes (lamc 2.1).** The whole package lives in `__init__.lam`
-  because `json` return types of functions re-exported from package
-  submodules are lost by the semantic checker; in your own code avoid
-  naming a local variable `log` (`log.info(...)` is lowered as a Go package
-  call).
 
 ## Testing
 
@@ -610,7 +605,7 @@ python3 tests/run_lamotel_tests.py --verbose        # or: lamc lib run test
 python3 tests/run_lamotel_tests.py -j 4 -k metrics  # parallel, filtered
 ```
 
-The runner uses the `lamc` on `PATH` (2.1.0 or newer), stages the package
+The runner uses the `lamc` on `PATH` (3.0.0 or newer), stages the package
 into a temporary `extlibs/@lam/otel` (the installed-package boundary),
 compiles every `tests/test_*.lam` file and compares its output with the
 `# expect:` lines. Export paths are tested against ephemeral local

@@ -1,0 +1,1353 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconcurrency import Mutex
+from lamconv import Conv
+from lamenv import Env
+from lamerrors import Result, Error
+from lamhttp import HttpClient, HttpResponse
+from lamjson import Json
+from lamrandom import Random
+from lamstrings import Strings
+from lamtime import Time
+
+# Raw Go is limited to what the Lam stdlib does not offer: gzip into a raw
+# byte string, percent coding, typed attribute encoding through a type switch,
+# timed calls, and the background ticker goroutine.
+go! {
+    import (
+        "bytes"
+        "compress/gzip"
+        "encoding/base64"
+        "fmt"
+        "math"
+        "net/url"
+        "reflect"
+        "regexp"
+        "sort"
+        "strconv"
+        "strings"
+        "time"
+        "unicode/utf8"
+    )
+
+    func otelGzip(text string) (string, error) {
+        var buf bytes.Buffer
+        zw := gzip.NewWriter(&buf)
+        if _, err := zw.Write([]byte(text)); err != nil {
+            return "", err
+        }
+        if err := zw.Close(); err != nil {
+            return "", err
+        }
+        return buf.String(), nil
+    }
+
+    func otelPercentDecode(text string) string {
+        if !strings.Contains(text, "%") {
+            return text
+        }
+        decoded, err := url.PathUnescape(text)
+        if err != nil {
+            return text
+        }
+        return decoded
+    }
+
+    // otelPercentEncode keeps the W3C baggage-octet range readable and
+    // percent-encodes everything else (spaces, commas, semicolons, '%', '"'
+    // and '\\' included).
+    func otelPercentEncode(text string) string {
+        var sb strings.Builder
+        for i := 0; i < len(text); i++ {
+            c := text[i]
+            if c > 0x20 && c < 0x7f && c != '"' && c != ',' && c != ';' && c != '\\' && c != '%' && c != '=' {
+                sb.WriteByte(c)
+            } else {
+                sb.WriteString(fmt.Sprintf("%%%02X", c))
+            }
+        }
+        return sb.String()
+    }
+
+    func otelTruncateString(text string, limit int) string {
+        if limit < 0 || utf8.RuneCountInString(text) <= limit {
+            return text
+        }
+        runes := []rune(text)
+        return string(runes[:limit])
+    }
+
+    // otelTruncate applies the attribute value length limit to strings and
+    // to the string members of arrays; other values are returned unchanged.
+    func otelTruncate(value interface{}, limit int) interface{} {
+        if limit < 0 {
+            return value
+        }
+        switch typed := value.(type) {
+        case string:
+            return otelTruncateString(typed, limit)
+        case []string:
+            out := make([]string, len(typed))
+            for i, item := range typed {
+                out[i] = otelTruncateString(item, limit)
+            }
+            return out
+        case []interface{}:
+            out := make([]interface{}, len(typed))
+            for i, item := range typed {
+                if text, ok := item.(string); ok {
+                    out[i] = otelTruncateString(text, limit)
+                } else {
+                    out[i] = item
+                }
+            }
+            return out
+        }
+        return value
+    }
+
+    func otelSortedKeys(attrs map[string]interface{}) []string {
+        keys := make([]string, 0, len(attrs))
+        for key := range attrs {
+            keys = append(keys, key)
+        }
+        sort.Strings(keys)
+        return keys
+    }
+
+    // otelAnyValue encodes one value as an OTLP/JSON AnyValue.
+    func otelAnyValue(value interface{}) map[string]interface{} {
+        switch typed := value.(type) {
+        case nil:
+            return map[string]interface{}{}
+        case string:
+            return map[string]interface{}{"stringValue": typed}
+        case bool:
+            return map[string]interface{}{"boolValue": typed}
+        case int:
+            return map[string]interface{}{"intValue": strconv.FormatInt(int64(typed), 10)}
+        case int8, int16, int32, int64:
+            return map[string]interface{}{"intValue": strconv.FormatInt(reflect.ValueOf(typed).Int(), 10)}
+        case uint, uint8, uint16, uint32, uint64:
+            return map[string]interface{}{"intValue": strconv.FormatUint(reflect.ValueOf(typed).Uint(), 10)}
+        case float32, float64:
+            f := reflect.ValueOf(typed).Float()
+            if math.IsNaN(f) || math.IsInf(f, 0) {
+                return map[string]interface{}{"stringValue": strconv.FormatFloat(f, 'g', -1, 64)}
+            }
+            return map[string]interface{}{"doubleValue": f}
+        case []byte:
+            return map[string]interface{}{"bytesValue": base64.StdEncoding.EncodeToString(typed)}
+        case fmt.Stringer:
+            if reflect.ValueOf(typed).Kind() != reflect.Slice && reflect.ValueOf(typed).Kind() != reflect.Map {
+                return map[string]interface{}{"stringValue": typed.String()}
+            }
+        }
+        rv := reflect.ValueOf(value)
+        switch rv.Kind() {
+        case reflect.Slice, reflect.Array:
+            values := make([]interface{}, 0, rv.Len())
+            for i := 0; i < rv.Len(); i++ {
+                values = append(values, otelAnyValue(rv.Index(i).Interface()))
+            }
+            return map[string]interface{}{"arrayValue": map[string]interface{}{"values": values}}
+        case reflect.Map:
+            if rv.Type().Key().Kind() == reflect.String {
+                entries := map[string]interface{}{}
+                for _, key := range rv.MapKeys() {
+                    entries[key.String()] = rv.MapIndex(key).Interface()
+                }
+                return map[string]interface{}{"kvlistValue": map[string]interface{}{"values": otelKeyValues(entries)}}
+            }
+        }
+        return map[string]interface{}{"stringValue": fmt.Sprint(value)}
+    }
+
+    // otelKeyValues encodes an attribute map as a key-sorted OTLP KeyValue list.
+    func otelKeyValues(attrs map[string]interface{}) []interface{} {
+        out := make([]interface{}, 0, len(attrs))
+        for _, key := range otelSortedKeys(attrs) {
+            out = append(out, map[string]interface{}{"key": key, "value": otelAnyValue(attrs[key])})
+        }
+        return out
+    }
+
+    // otelAttributeKey is a canonical, order-independent identity for an
+    // attribute set (used to group metric points and resources).
+    func otelAttributeKey(attrs map[string]interface{}) string {
+        var sb strings.Builder
+        for _, key := range otelSortedKeys(attrs) {
+            sb.WriteString(key)
+            sb.WriteString("\x1f")
+            sb.WriteString(fmt.Sprintf("%T:%v", attrs[key], attrs[key]))
+            sb.WriteString("\x1e")
+        }
+        return sb.String()
+    }
+
+    func otelTypeName(value interface{}) string {
+        if value == nil {
+            return ""
+        }
+        name := fmt.Sprintf("%T", value)
+        name = strings.TrimLeft(name, "*")
+        if idx := strings.LastIndex(name, "."); idx >= 0 {
+            name = name[idx+1:]
+        }
+        return name
+    }
+
+    func otelHex2(value int) string {
+        return fmt.Sprintf("%02x", value&0xff)
+    }
+
+    func otelParseHex2(text string) int {
+        v, err := strconv.ParseUint(text, 16, 8)
+        if err != nil {
+            return -1
+        }
+        return int(v)
+    }
+
+    // otelRatioSampled implements the TraceIdRatioBased decision: the low
+    // 8 bytes of the trace id, read as an unsigned integer and shifted to
+    // 63 bits, are compared against ratio * 2^63 (deterministic per trace).
+    func otelRatioSampled(traceID string, ratio float64) bool {
+        if ratio >= 1 {
+            return true
+        }
+        if ratio <= 0 || len(traceID) != 32 {
+            return false
+        }
+        low, err := strconv.ParseUint(traceID[16:], 16, 64)
+        if err != nil {
+            return false
+        }
+        bound := uint64(ratio * float64(uint64(1)<<63))
+        return (low >> 1) < bound
+    }
+
+    var otelTraceStateKey = regexp.MustCompile(`^([a-z0-9][a-z0-9_\-*/]{0,240}@[a-z][a-z0-9_\-*/]{0,13}|[a-z][a-z0-9_\-*/]{0,255})$`)
+    var otelTraceStateValue = regexp.MustCompile(`^[\x20-\x2b\x2d-\x3c\x3e-\x7e]{0,255}[\x21-\x2b\x2d-\x3c\x3e-\x7e]$`)
+    var otelBaggageKey = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
+
+    func otelValidTraceStateMember(key string, value string) bool {
+        return otelTraceStateKey.MatchString(key) && otelTraceStateValue.MatchString(value)
+    }
+
+    func otelValidToken(key string) bool {
+        return otelBaggageKey.MatchString(key)
+    }
+
+    func otelFloatString(value float64) string {
+        return strconv.FormatFloat(value, 'g', -1, 64)
+    }
+}
+
+const OtelSdkName: str = "@lam/otel"
+const OtelSdkVersion: str = "1.1.0"
+const OtelUserAgent: str = "lam-otel/1.1.0"
+
+class OtelUtil {
+    #- Small helpers shared by the tracing, metrics and logs modules: ID
+    generation, ``key=value`` list parsing, percent coding, environment
+    parsing, and OTLP/JSON attribute encoding. Application code usually
+    reaches them through the ``Otel`` facade. -#
+
+    static func randomHex(byteCount: int) -> str {
+        #- Return ``byteCount`` cryptographically random bytes as lowercase
+        hex, never all zeros (an all-zero trace or span id is invalid). -#
+        while true {
+            id: str = Random.secureBytes(byteCount).unwrap()
+            if not OtelUtil.isZeroHex(id) {
+                return id
+            }
+        }
+        return ""
+    }
+
+    static func traceId() -> str {
+        #- A new random 16-byte (32 hex characters) W3C trace id. -#
+        return OtelUtil.randomHex(16)
+    }
+
+    static func spanId() -> str {
+        #- A new random 8-byte (16 hex characters) W3C span id. -#
+        return OtelUtil.randomHex(8)
+    }
+
+    static func isZeroHex(text: str) -> bool {
+        #- True when ``text`` is empty or only contains ``0`` characters. -#
+        for ch in text {
+            if ch != "0" {
+                return false
+            }
+        }
+        return true
+    }
+
+    static func isLowerHex(text: str, length: int) -> bool {
+        #- True when ``text`` has exactly ``length`` lowercase hex digits. -#
+        if len(text) != length {
+            return false
+        }
+        for ch in text {
+            if not ("0123456789abcdef".contains(ch)) {
+                return false
+            }
+        }
+        return true
+    }
+
+    static func parsePairs(text: str) -> dict[str, str] {
+        #- Parse a comma-separated ``key=value`` list (the format of
+        ``OTEL_RESOURCE_ATTRIBUTES`` and ``OTEL_EXPORTER_OTLP_HEADERS``).
+        Keys and values are trimmed, values are percent-decoded, a value may
+        contain ``=``, and members without ``=`` or with an empty key are
+        skipped. -#
+        out: dict[str, str] = {}
+        if text.trim() == "" {
+            return out
+        }
+        for part in text.split(",") {
+            idx: int = part.index("=")
+            if idx > 0 {
+                key: str = part[:idx].trim()
+                val: str = OtelUtil.percentDecode(part[idx + 1:].trim())
+                if key != "" {
+                    out[key] = val
+                }
+            }
+        }
+        return out
+    }
+
+    static func percentDecode(text: str) -> str {
+        #- Decode ``%XX`` escapes; malformed input is returned unchanged. -#
+        return go!(otelPercentDecode(text))
+    }
+
+    static func percentEncode(text: str) -> str {
+        #- Percent-encode everything outside the W3C baggage octet range. -#
+        return go!(otelPercentEncode(text))
+    }
+
+    static func gzip(text: str) -> Result[str] {
+        #- Gzip ``text`` and return the compressed bytes as a raw string
+        (suitable as an HTTP request body with ``Content-Encoding: gzip``). -#
+        go! {
+            out, err := otelGzip(text)
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("OtelCompressionError", err.Error(), nil))
+            }
+            return LAMMERGEIER.Result.Ok(out)
+        }
+    }
+
+    static func envString(name: str, fallback: str = "") -> str {
+        #- The trimmed value of ``name``, or ``fallback`` when the variable is
+        unset or blank (the OpenTelemetry convention: empty means unset). -#
+        value: str = Env.getOr(name, "").trim()
+        if value == "" {
+            return fallback
+        }
+        return value
+    }
+
+    static func envInt(name: str, fallback: int) -> int {
+        #- ``name`` parsed as an integer, or ``fallback`` when unset/invalid. -#
+        raw: str = OtelUtil.envString(name, "")
+        if raw == "" {
+            return fallback
+        }
+        parsed: Result[int] = Conv.parse(raw)
+        if not parsed.ok() {
+            return fallback
+        }
+        return parsed.unwrap()
+    }
+
+    static func envFloat(name: str, fallback: float) -> float {
+        #- ``name`` parsed as a float, or ``fallback`` when unset/invalid. -#
+        raw: str = OtelUtil.envString(name, "")
+        if raw == "" {
+            return fallback
+        }
+        parsed: Result[float] = Conv.parse(raw)
+        if not parsed.ok() {
+            return fallback
+        }
+        return parsed.unwrap()
+    }
+
+    static func parseFloatOr(text: str, fallback: float) -> float {
+        #- ``text`` parsed as a float, or ``fallback`` when malformed. -#
+        parsed: Result[float] = Conv.parse(text.trim())
+        if not parsed.ok() {
+            return fallback
+        }
+        return parsed.unwrap()
+    }
+
+    static func envBool(name: str, fallback: bool) -> bool {
+        #- ``true``/``false`` (case-insensitive) for ``name``, else ``fallback``. -#
+        raw: str = OtelUtil.envString(name, "").toLower()
+        if raw == "true" {
+            return true
+        }
+        if raw == "false" {
+            return false
+        }
+        return fallback
+    }
+
+    static func nowUnixNano() -> int {
+        #- The current wall-clock time in Unix nanoseconds. -#
+        return Time.nowUnixNano()
+    }
+
+    static func truncate(value: any, limit: int) -> any {
+        #- Apply an attribute value length limit (``-1`` = unlimited) to a
+        string or to the strings of an array. -#
+        return go!(otelTruncate(value, limit))
+    }
+
+    static func setLimited(attrs: dict[str, any], key: str, value: any, countLimit: int, lengthLimit: int) -> bool {
+        #- Store ``attrs[key] = value`` honouring the count and length limits.
+        Overwriting an existing key always succeeds; a new key beyond
+        ``countLimit`` (``-1`` = unlimited) is rejected and ``false`` is
+        returned so the caller can count it as dropped. Empty keys and
+        ``None`` values are ignored (and return ``true``). -#
+        if key == "" or value == None {
+            return true
+        }
+        if key not in attrs and countLimit >= 0 and len(attrs) >= countLimit {
+            return false
+        }
+        attrs[key] = OtelUtil.truncate(value, lengthLimit)
+        return true
+    }
+
+    static func attributesJson(attrs: dict[str, any]) -> json {
+        #- Encode ``attrs`` as a key-sorted OTLP/JSON ``KeyValue`` array. -#
+        raw: any = go!(otelKeyValues(attrs))
+        return Json.fromValue(raw).unwrap()
+    }
+
+    static func anyValueJson(value: any) -> json {
+        #- Encode one value as an OTLP/JSON ``AnyValue`` (``stringValue``,
+        ``intValue``, ``doubleValue``, ``boolValue``, ``bytesValue``,
+        ``arrayValue`` or ``kvlistValue``). -#
+        raw: any = go!(otelAnyValue(value))
+        return Json.fromValue(raw).unwrap()
+    }
+
+    static func bytesValueJson(raw: str) -> json {
+        #- Encode the raw bytes of ``raw`` as an OTLP/JSON ``bytesValue``
+        (base64). -#
+        value: any = go!([]byte(raw))
+        return OtelUtil.anyValueJson(value)
+    }
+
+    static func attributeKey(attrs: dict[str, any]) -> str {
+        #- A canonical identity string for an attribute set. -#
+        return go!(otelAttributeKey(attrs))
+    }
+
+    static func copyAttributes(attrs: dict[str, any]) -> dict[str, any] {
+        #- A shallow copy of ``attrs``. -#
+        out: dict[str, any] = {}
+        for k, v in attrs {
+            out[k] = v
+        }
+        return out
+    }
+
+    static func sortedKeys(attrs: dict[str, any]) -> list[str] {
+        #- The keys of ``attrs`` in ascending order. -#
+        return go!(otelSortedKeys(attrs))
+    }
+
+    static func typeName(value: any) -> str {
+        #- The Go-level type name of ``value`` without package or pointer
+        prefix (``Error`` for a ``lamerrors.Error``). -#
+        return go!(otelTypeName(value))
+    }
+
+    static func nanosString(nanos: int) -> str {
+        #- OTLP/JSON encodes 64-bit integers as decimal strings. -#
+        return str(nanos)
+    }
+
+    static func hex2(value: int) -> str {
+        #- ``value`` (0-255) as two lowercase hex digits. -#
+        return go!(otelHex2(value))
+    }
+
+    static func parseHex2(text: str) -> int {
+        #- Two hex digits as an integer, or ``-1`` when malformed. -#
+        if len(text) != 2 {
+            return -1
+        }
+        return go!(otelParseHex2(text))
+    }
+
+    static func ratioSampled(traceId: str, ratio: float) -> bool {
+        #- The deterministic ``TraceIdRatioBased`` decision for ``traceId``. -#
+        return go!(otelRatioSampled(traceId, ratio))
+    }
+
+    static func validTraceStateMember(key: str, value: str) -> bool {
+        #- True when ``key=value`` is a valid W3C ``tracestate`` list member. -#
+        return go!(otelValidTraceStateMember(key, value))
+    }
+
+    static func validToken(text: str) -> bool {
+        #- True when ``text`` is an RFC 7230 token (a valid baggage key). -#
+        return go!(otelValidToken(text))
+    }
+
+    static func floatString(value: float) -> str {
+        #- The shortest decimal representation of ``value``. -#
+        return go!(otelFloatString(value))
+    }
+
+    static func header(headers: dict[str, str], name: str) -> str {
+        #- Case-insensitive lookup of ``name`` in a header dictionary
+        (``""`` when absent). -#
+        if name in headers {
+            return headers[name]
+        }
+        lower: str = name.toLower()
+        for k, v in headers {
+            if k.toLower() == lower {
+                return v
+            }
+        }
+        return ""
+    }
+
+    static func setHeader(headers: dict[str, str], name: str, value: str) {
+        #- Set ``name`` in ``headers``, replacing any differently-cased
+        spelling of the same header. -#
+        lower: str = name.toLower()
+        stale: list[str] = []
+        for k, _v in headers {
+            if k.toLower() == lower and k != name {
+                stale.append(k)
+            }
+        }
+        for k in stale {
+            del headers[k]
+        }
+        headers[name] = value
+    }
+}
+
+class OtelResource {
+    #- The entity producing telemetry: a set of attributes such as
+    ``service.name``, ``service.version`` and ``deployment.environment``
+    that is attached to every exported span, metric and log record. -#
+
+    func init(self, attributes: dict[str, any] = {}) {
+        self.attributes: dict[str, any] = OtelUtil.copyAttributes(attributes)
+    }
+
+    static func fromEnv() -> OtelResource {
+        #- Build the resource from ``OTEL_RESOURCE_ATTRIBUTES`` and
+        ``OTEL_SERVICE_NAME`` (which wins over a ``service.name`` attribute),
+        plus the SDK's ``telemetry.sdk.*`` attributes. -#
+        return OtelConfig.fromEnv().resource()
+    }
+
+    static func sdkDefaults() -> OtelResource {
+        #- The ``telemetry.sdk.name``/``language``/``version`` attributes and
+        ``service.name = unknown_service``. -#
+        res: OtelResource = OtelResource()
+        res.attributes["service.name"] = "unknown_service"
+        res.attributes["telemetry.sdk.name"] = OtelSdkName
+        res.attributes["telemetry.sdk.language"] = "lammergeier"
+        res.attributes["telemetry.sdk.version"] = OtelSdkVersion
+        return res
+    }
+
+    func set(self, key: str, value: any) {
+        #- Set one attribute (``None`` values and empty keys are ignored). -#
+        if key != "" and value != None {
+            self.attributes[key] = value
+        }
+    }
+
+    func get(self, key: str) -> any {
+        #- The attribute value for ``key``, or ``None``. -#
+        if key in self.attributes {
+            return self.attributes[key]
+        }
+        return None
+    }
+
+    func getString(self, key: str, fallback: str = "") -> str {
+        #- The attribute for ``key`` formatted as a string, or ``fallback``. -#
+        if key in self.attributes {
+            return str(self.attributes[key])
+        }
+        return fallback
+    }
+
+    func has(self, key: str) -> bool {
+        #- True when the resource carries ``key``. -#
+        return key in self.attributes
+    }
+
+    func serviceName(self) -> str {
+        #- The ``service.name`` attribute (``unknown_service`` if missing). -#
+        return self.getString("service.name", "unknown_service")
+    }
+
+    func merge(self, other: OtelResource) -> OtelResource {
+        #- A new resource with the attributes of both; ``other`` wins on
+        conflicts. -#
+        out: OtelResource = OtelResource(self.attributes)
+        if other != None {
+            for k, v in other.attributes {
+                out.attributes[k] = v
+            }
+        }
+        return out
+    }
+
+    func key(self) -> str {
+        #- Canonical identity used to group telemetry per resource. -#
+        return OtelUtil.attributeKey(self.attributes)
+    }
+
+    func toJson(self) -> json {
+        #- The OTLP/JSON ``Resource`` message. -#
+        return {"attributes": OtelUtil.attributesJson(self.attributes)}
+    }
+}
+
+class OtelConfig {
+    #- SDK configuration. ``OtelConfig.fromEnv()`` reads the standard
+    ``OTEL_*`` environment variables; the constructor and the public fields
+    allow configuring everything in code. Only the OTLP/HTTP JSON protocol
+    is implemented. -#
+
+    func init(self, serviceName: str = "unknown_service", endpoint: str = "http://localhost:4318", headers: str = "", timeoutMs: int = 10000) {
+        self.serviceName: str = serviceName
+        self.endpoint: str = endpoint
+        self.headers: str = headers
+        self.timeoutMs: int = timeoutMs
+        self.serviceVersion: str = ""
+        self.environment: str = ""
+        self.resourceAttributes: dict[str, str] = {}
+        self.disabled: bool = false
+
+        self.tracesEndpoint: str = ""
+        self.metricsEndpoint: str = ""
+        self.logsEndpoint: str = ""
+        self.tracesHeaders: str = ""
+        self.metricsHeaders: str = ""
+        self.logsHeaders: str = ""
+        self.tracesTimeoutMs: int = 0
+        self.metricsTimeoutMs: int = 0
+        self.logsTimeoutMs: int = 0
+        self.compression: str = "none"
+        self.tracesCompression: str = ""
+        self.metricsCompression: str = ""
+        self.logsCompression: str = ""
+        self.protocol: str = "http/json"
+
+        self.tracesExporter: str = "otlp"
+        self.metricsExporter: str = "otlp"
+        self.logsExporter: str = "otlp"
+        self.propagators: str = "tracecontext,baggage"
+
+        self.sampler: str = "parentbased_always_on"
+        self.samplerArg: str = ""
+
+        self.bspScheduleDelayMs: int = 5000
+        self.bspExportTimeoutMs: int = 30000
+        self.bspMaxQueueSize: int = 2048
+        self.bspMaxExportBatchSize: int = 512
+        self.blrpScheduleDelayMs: int = 1000
+        self.blrpExportTimeoutMs: int = 30000
+        self.blrpMaxQueueSize: int = 2048
+        self.blrpMaxExportBatchSize: int = 512
+        self.metricExportIntervalMs: int = 60000
+        self.metricExportTimeoutMs: int = 30000
+
+        self.attributeCountLimit: int = 128
+        self.attributeValueLengthLimit: int = -1
+        self.spanAttributeCountLimit: int = -2
+        self.spanAttributeValueLengthLimit: int = -2
+        self.spanEventCountLimit: int = 128
+        self.spanLinkCountLimit: int = 128
+        self.eventAttributeCountLimit: int = 128
+        self.linkAttributeCountLimit: int = 128
+        self.logRecordAttributeCountLimit: int = -2
+        self.logRecordAttributeValueLengthLimit: int = -2
+
+        self.retryMaxAttempts: int = 5
+        self.retryInitialBackoffMs: int = 1000
+        self.retryMaxBackoffMs: int = 5000
+    }
+
+    static func fromEnv() -> OtelConfig {
+        #- Read the standard ``OTEL_*`` environment variables (see the README
+        configuration table). Unset or blank variables keep the defaults. -#
+        resourcePairs: dict[str, str] = OtelUtil.parsePairs(Env.getOr("OTEL_RESOURCE_ATTRIBUTES", ""))
+        defaultName: str = "unknown_service"
+        if "service.name" in resourcePairs and resourcePairs["service.name"] != "" {
+            defaultName = resourcePairs["service.name"]
+        }
+        cfg: OtelConfig = OtelConfig(
+            OtelUtil.envString("OTEL_SERVICE_NAME", defaultName),
+            OtelUtil.envString("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+            OtelUtil.envString("OTEL_EXPORTER_OTLP_HEADERS", ""),
+            OtelUtil.envInt("OTEL_EXPORTER_OTLP_TIMEOUT", 10000),
+        )
+        cfg.resourceAttributes = resourcePairs
+        cfg.serviceVersion = OtelUtil.envString("OTEL_SERVICE_VERSION", "")
+        cfg.environment = OtelUtil.envString("OTEL_DEPLOYMENT_ENVIRONMENT", "")
+        cfg.disabled = OtelUtil.envBool("OTEL_SDK_DISABLED", false)
+
+        cfg.tracesEndpoint = OtelUtil.envString("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
+        cfg.metricsEndpoint = OtelUtil.envString("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "")
+        cfg.logsEndpoint = OtelUtil.envString("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "")
+        cfg.tracesHeaders = OtelUtil.envString("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+        cfg.metricsHeaders = OtelUtil.envString("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "")
+        cfg.logsHeaders = OtelUtil.envString("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "")
+        cfg.tracesTimeoutMs = OtelUtil.envInt("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", 0)
+        cfg.metricsTimeoutMs = OtelUtil.envInt("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT", 0)
+        cfg.logsTimeoutMs = OtelUtil.envInt("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", 0)
+        cfg.compression = OtelUtil.envString("OTEL_EXPORTER_OTLP_COMPRESSION", "none").toLower()
+        cfg.tracesCompression = OtelUtil.envString("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "").toLower()
+        cfg.metricsCompression = OtelUtil.envString("OTEL_EXPORTER_OTLP_METRICS_COMPRESSION", "").toLower()
+        cfg.logsCompression = OtelUtil.envString("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "").toLower()
+        cfg.protocol = OtelUtil.envString("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json").toLower()
+
+        cfg.tracesExporter = OtelUtil.envString("OTEL_TRACES_EXPORTER", "otlp").toLower()
+        cfg.metricsExporter = OtelUtil.envString("OTEL_METRICS_EXPORTER", "otlp").toLower()
+        cfg.logsExporter = OtelUtil.envString("OTEL_LOGS_EXPORTER", "otlp").toLower()
+        cfg.propagators = OtelUtil.envString("OTEL_PROPAGATORS", "tracecontext,baggage").toLower()
+        cfg.sampler = OtelUtil.envString("OTEL_TRACES_SAMPLER", "parentbased_always_on").toLower()
+        cfg.samplerArg = OtelUtil.envString("OTEL_TRACES_SAMPLER_ARG", "")
+
+        cfg.bspScheduleDelayMs = OtelUtil.envInt("OTEL_BSP_SCHEDULE_DELAY", 5000)
+        cfg.bspExportTimeoutMs = OtelUtil.envInt("OTEL_BSP_EXPORT_TIMEOUT", 30000)
+        cfg.bspMaxQueueSize = OtelUtil.envInt("OTEL_BSP_MAX_QUEUE_SIZE", 2048)
+        cfg.bspMaxExportBatchSize = OtelUtil.envInt("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", 512)
+        cfg.blrpScheduleDelayMs = OtelUtil.envInt("OTEL_BLRP_SCHEDULE_DELAY", 1000)
+        cfg.blrpExportTimeoutMs = OtelUtil.envInt("OTEL_BLRP_EXPORT_TIMEOUT", 30000)
+        cfg.blrpMaxQueueSize = OtelUtil.envInt("OTEL_BLRP_MAX_QUEUE_SIZE", 2048)
+        cfg.blrpMaxExportBatchSize = OtelUtil.envInt("OTEL_BLRP_MAX_EXPORT_BATCH_SIZE", 512)
+        cfg.metricExportIntervalMs = OtelUtil.envInt("OTEL_METRIC_EXPORT_INTERVAL", 60000)
+        cfg.metricExportTimeoutMs = OtelUtil.envInt("OTEL_METRIC_EXPORT_TIMEOUT", 30000)
+
+        cfg.attributeCountLimit = OtelUtil.envInt("OTEL_ATTRIBUTE_COUNT_LIMIT", 128)
+        cfg.attributeValueLengthLimit = OtelUtil.envInt("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", -1)
+        cfg.spanAttributeCountLimit = OtelUtil.envInt("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", -2)
+        cfg.spanAttributeValueLengthLimit = OtelUtil.envInt("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", -2)
+        cfg.spanEventCountLimit = OtelUtil.envInt("OTEL_SPAN_EVENT_COUNT_LIMIT", 128)
+        cfg.spanLinkCountLimit = OtelUtil.envInt("OTEL_SPAN_LINK_COUNT_LIMIT", 128)
+        cfg.eventAttributeCountLimit = OtelUtil.envInt("OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT", 128)
+        cfg.linkAttributeCountLimit = OtelUtil.envInt("OTEL_LINK_ATTRIBUTE_COUNT_LIMIT", 128)
+        cfg.logRecordAttributeCountLimit = OtelUtil.envInt("OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT", -2)
+        cfg.logRecordAttributeValueLengthLimit = OtelUtil.envInt("OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT", -2)
+        return cfg
+    }
+
+    func isReady(self) -> bool {
+        #- True when an OTLP endpoint is configured for at least one signal. -#
+        return self.endpoint != "" or self.tracesEndpoint != "" or self.metricsEndpoint != "" or self.logsEndpoint != ""
+    }
+
+    private func _signalUrl(self, path: str, explicit: str) -> str {
+        if explicit != "" {
+            return explicit
+        }
+        if self.endpoint == "" {
+            return ""
+        }
+        ep: str = self.endpoint.trimRight("/")
+        if ep.endsWith(path) {
+            return ep
+        }
+        return ep + path
+    }
+
+    func tracesUrl(self) -> str {
+        #- ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` as is, else the base endpoint
+        plus ``/v1/traces`` (empty when no endpoint is configured). -#
+        return self._signalUrl("/v1/traces", self.tracesEndpoint)
+    }
+
+    func metricsUrl(self) -> str {
+        #- The OTLP/HTTP metrics URL (``.../v1/metrics``). -#
+        return self._signalUrl("/v1/metrics", self.metricsEndpoint)
+    }
+
+    func logsUrl(self) -> str {
+        #- The OTLP/HTTP logs URL (``.../v1/logs``). -#
+        return self._signalUrl("/v1/logs", self.logsEndpoint)
+    }
+
+    func urlFor(self, signal: str) -> str {
+        #- The URL for ``"traces"``, ``"metrics"`` or ``"logs"``. -#
+        if signal == "metrics" {
+            return self.metricsUrl()
+        }
+        if signal == "logs" {
+            return self.logsUrl()
+        }
+        return self.tracesUrl()
+    }
+
+    func headersFor(self, signal: str) -> dict[str, str] {
+        #- The parsed generic OTLP headers merged with the signal-specific
+        ones (signal-specific values win). -#
+        out: dict[str, str] = OtelUtil.parsePairs(self.headers)
+        specific: str = self.tracesHeaders
+        if signal == "metrics" {
+            specific = self.metricsHeaders
+        } elif signal == "logs" {
+            specific = self.logsHeaders
+        }
+        for k, v in OtelUtil.parsePairs(specific) {
+            out[k] = v
+        }
+        return out
+    }
+
+    func timeoutFor(self, signal: str) -> int {
+        #- The export timeout in milliseconds for ``signal``. -#
+        value: int = self.tracesTimeoutMs
+        if signal == "metrics" {
+            value = self.metricsTimeoutMs
+        } elif signal == "logs" {
+            value = self.logsTimeoutMs
+        }
+        if value > 0 {
+            return value
+        }
+        return self.timeoutMs
+    }
+
+    func compressionFor(self, signal: str) -> str {
+        #- ``"gzip"`` or ``"none"`` for ``signal``. -#
+        value: str = self.tracesCompression
+        if signal == "metrics" {
+            value = self.metricsCompression
+        } elif signal == "logs" {
+            value = self.logsCompression
+        }
+        if value == "" {
+            value = self.compression
+        }
+        if value == "gzip" {
+            return "gzip"
+        }
+        return "none"
+    }
+
+    func exporterFor(self, signal: str) -> str {
+        #- ``"otlp"``, ``"console"`` or ``"none"`` (``OTEL_*_EXPORTER``). -#
+        if signal == "metrics" {
+            return self.metricsExporter
+        }
+        if signal == "logs" {
+            return self.logsExporter
+        }
+        return self.tracesExporter
+    }
+
+    func resource(self) -> OtelResource {
+        #- The resource described by this configuration: SDK defaults, then
+        ``resourceAttributes``, then ``service.name``/``service.version``/
+        ``deployment.environment`` from the dedicated fields. -#
+        res: OtelResource = OtelResource.sdkDefaults()
+        for k, v in self.resourceAttributes {
+            res.attributes[k] = v
+        }
+        if self.serviceName != "" {
+            res.attributes["service.name"] = self.serviceName
+        }
+        if self.serviceVersion != "" {
+            res.attributes["service.version"] = self.serviceVersion
+        }
+        if self.environment != "" {
+            res.attributes["deployment.environment"] = self.environment
+        }
+        return res
+    }
+}
+
+class OtelExportResult {
+    #- Outcome of one OTLP export call. ``status`` is the HTTP status (``0``
+    for in-memory and console exporters), ``attempts`` counts HTTP
+    attempts including retries, ``items`` the exported spans/points/records,
+    and ``rejected``/``errorMessage`` reflect an OTLP ``partialSuccess``. -#
+
+    func init(self, status: int = 0, body: str = "", attempts: int = 0, items: int = 0) {
+        self.status: int = status
+        self.body: str = body
+        self.attempts: int = attempts
+        self.items: int = items
+        self.rejected: int = 0
+        self.errorMessage: str = ""
+    }
+
+    func ok(self) -> bool {
+        #- True for a 2xx response (or a local exporter). -#
+        return self.status == 0 or (self.status >= 200 and self.status < 300)
+    }
+
+    func partial(self) -> bool {
+        #- True when the collector reported rejected items. -#
+        return self.rejected > 0
+    }
+}
+
+class OtelOtlpHttp {
+    #- OTLP/HTTP JSON transport shared by the span, metric and log
+    exporters: posts a payload with the configured headers, timeout and
+    optional gzip compression, and retries transport failures and
+    ``429``/``500``/``502``/``503``/``504`` responses with exponential
+    backoff (honouring ``Retry-After``, capped by ``maxBackoffMs``). -#
+
+    func init(self, url: str, headers: dict[str, str] = {}, timeoutMs: int = 10000, compression: str = "none", maxAttempts: int = 5, initialBackoffMs: int = 1000, maxBackoffMs: int = 5000) {
+        self.url: str = url
+        self.headers: dict[str, str] = {}
+        for k, v in headers {
+            self.headers[k] = v
+        }
+        self.timeoutMs: int = timeoutMs
+        self.compression: str = compression
+        self.maxAttempts: int = maxAttempts
+        self.initialBackoffMs: int = initialBackoffMs
+        self.maxBackoffMs: int = maxBackoffMs
+        self.client: HttpClient = HttpClient("", timeoutMs)
+        self.client.setHeader("User-Agent", OtelUserAgent)
+        for k, v in self.headers {
+            self.client.setHeader(k, v)
+        }
+        if compression == "gzip" {
+            self.client.setHeader("Content-Encoding", "gzip")
+        }
+    }
+
+    static func forSignal(cfg: OtelConfig, signal: str) -> OtelOtlpHttp {
+        #- A transport for ``"traces"``, ``"metrics"`` or ``"logs"`` built
+        from ``cfg`` (URL, headers, timeout, compression, retry policy). -#
+        return OtelOtlpHttp(
+            cfg.urlFor(signal),
+            cfg.headersFor(signal),
+            cfg.timeoutFor(signal),
+            cfg.compressionFor(signal),
+            cfg.retryMaxAttempts,
+            cfg.retryInitialBackoffMs,
+            cfg.retryMaxBackoffMs,
+        )
+    }
+
+    static func retryable(status: int) -> bool {
+        #- True for the HTTP statuses the OTLP specification lists as
+        retryable (plus ``500``). -#
+        return status == 429 or status == 500 or status == 502 or status == 503 or status == 504
+    }
+
+    func backoffMs(self, attempt: int, retryAfter: str = "") -> int {
+        #- The wait before retry number ``attempt`` (1-based): the
+        ``Retry-After`` seconds when present, else ``initialBackoffMs *
+        2^(attempt-1)``; never above ``maxBackoffMs``. -#
+        delay: int = self.initialBackoffMs
+        i: int = 1
+        while i < attempt {
+            delay = delay * 2
+            if delay >= self.maxBackoffMs {
+                break
+            }
+            i += 1
+        }
+        if retryAfter.trim() != "" {
+            seconds: Result[int] = Conv.parse(retryAfter.trim())
+            if seconds.ok() {
+                delay = seconds.unwrap() * 1000
+            }
+        }
+        if delay > self.maxBackoffMs {
+            delay = self.maxBackoffMs
+        }
+        if delay < 0 {
+            delay = 0
+        }
+        return delay
+    }
+
+    func send(self, payload: json, items: int = 0) -> Result[OtelExportResult] {
+        #- POST ``payload`` to ``url``. ``Ok`` for a 2xx response (inspect
+        ``rejected`` for partial success); ``Err(OtelExportError)`` after the
+        last failed attempt, with the final ``OtelExportResult`` (or the
+        transport error) as the cause. -#
+        if self.url == "" {
+            return Result.Err(Error("OtelConfigError", "OTLP endpoint is not configured (OTEL_EXPORTER_OTLP_ENDPOINT)", None))
+        }
+        body: str = Json.encode(payload)?
+        if self.compression == "gzip" {
+            body = OtelUtil.gzip(body)?
+        }
+        attempts: int = 0
+        maxAttempts: int = self.maxAttempts
+        if maxAttempts < 1 {
+            maxAttempts = 1
+        }
+        lastMessage: str = ""
+        cause: any = None
+        while attempts < maxAttempts {
+            attempts += 1
+            response: Result[HttpResponse] = self.client.post(self.url, "application/json", body)
+            retryAfter: str = ""
+            if response.ok() {
+                res: HttpResponse = response.unwrap()
+                result: OtelExportResult = OtelExportResult(res.status, res.body, attempts, items)
+                if res.ok() {
+                    OtelOtlpHttp._partialSuccess(result)
+                    return Result.Ok(result)
+                }
+                lastMessage = res.body.trim()
+                if lastMessage == "" {
+                    lastMessage = "OTLP export failed with status " + str(res.status)
+                } else {
+                    lastMessage = "OTLP export failed with status " + str(res.status) + ": " + lastMessage
+                }
+                cause = result
+                if not OtelOtlpHttp.retryable(res.status) {
+                    return Result.Err(Error("OtelExportError", lastMessage, result))
+                }
+                retryAfter = res.header("Retry-After", "")
+            } else {
+                lastMessage = "OTLP export transport failed: " + str(response.error)
+                cause = response.error
+            }
+            if attempts < maxAttempts {
+                Time.sleepMs(self.backoffMs(attempts, retryAfter))
+            }
+        }
+        return Result.Err(Error("OtelExportError", lastMessage + " (after " + str(attempts) + " attempts)", cause))
+    }
+
+    private static func _partialSuccess(result: OtelExportResult) {
+        if result.body.trim() == "" or not result.body.contains("partialSuccess") {
+            return
+        }
+        decoded: Result[json] = Json.decode(result.body)
+        if not decoded.ok() {
+            return
+        }
+        doc: json = decoded.unwrap()
+        if Json.kind(doc) != "object" {
+            return
+        }
+        partial: json = doc["partialSuccess"]
+        if Json.kind(partial) != "object" {
+            return
+        }
+        for field in ["rejectedSpans", "rejectedDataPoints", "rejectedLogRecords"] {
+            raw: json = partial[field]
+            if raw != None {
+                text: str = str(raw).replace("\"", "")
+                parsed: Result[int] = Conv.parse(text)
+                if parsed.ok() {
+                    result.rejected = parsed.unwrap()
+                }
+            }
+        }
+        message: json = partial["errorMessage"]
+        if message != None {
+            result.errorMessage = str(message).replace("\"", "")
+        }
+    }
+}
+
+class OtelWorker {
+    #- A background goroutine that runs ``task`` every ``intervalMs``
+    milliseconds and whenever ``wake()`` is called; ``stop()`` ends the
+    loop and waits for an in-flight run. Panics inside ``task`` are
+    recovered so telemetry never crashes the application. -#
+
+    func init(self, intervalMs: int, task: func()) {
+        self.intervalMs: int = intervalMs
+        self.task: func() = task
+        self.running: bool = false
+        self.runs: int = 0
+        self.stopCh: any = None
+        self.wakeCh: any = None
+        self.doneCh: any = None
+        self.lock: Mutex = Mutex()
+    }
+
+    func start(self) {
+        #- Start the loop (no-op when already running). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.running {
+            return
+        }
+        self.running = true
+        interval: int = self.intervalMs
+        if interval <= 0 {
+            interval = 1000
+        }
+        task: func() = self.task
+        go! {
+            stop := make(chan struct{})
+            wake := make(chan struct{}, 1)
+            done := make(chan struct{})
+            s.StopCh = stop
+            s.WakeCh = wake
+            s.DoneCh = done
+            worker := s
+            run := func() {
+                defer func() { _ = recover() }()
+                task()
+                worker.Lock.Lock()
+                worker.Runs++
+                worker.Lock.Unlock()
+            }
+            go func() {
+                defer close(done)
+                ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+                defer ticker.Stop()
+                for {
+                    select {
+                    case <-stop:
+                        return
+                    case <-ticker.C:
+                        run()
+                    case <-wake:
+                        run()
+                    }
+                }
+            }()
+        }
+    }
+
+    func wake(self) {
+        #- Ask the loop to run ``task`` now (coalesced, never blocks). -#
+        go! {
+            if wake, ok := s.WakeCh.(chan struct{}); ok {
+                select {
+                case wake <- struct{}{}:
+                default:
+                }
+            }
+        }
+    }
+
+    func stop(self) {
+        #- Stop the loop and wait until it has exited. -#
+        self.lock.lock()
+        if not self.running {
+            self.lock.unlock()
+            return
+        }
+        self.running = false
+        self.lock.unlock()
+        go! {
+            if stop, ok := s.StopCh.(chan struct{}); ok {
+                close(stop)
+            }
+            if done, ok := s.DoneCh.(chan struct{}); ok {
+                <-done
+            }
+        }
+    }
+
+    func runCount(self) -> int {
+        #- How many times ``task`` has run. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.runs
+    }
+}
+
+func otelCallWithTimeout(timeoutMs: int, fn: func() -> Result[OtelExportResult]) -> Result[OtelExportResult] {
+    #- Run ``fn`` and wait at most ``timeoutMs`` (``<= 0`` waits forever).
+    On timeout an ``OtelTimeoutError`` is returned and the call keeps
+    running in the background; a panic becomes an ``OtelExportError``. -#
+    go! {
+        ch := make(chan *LAMMERGEIER.Result, 1)
+        go func() {
+            defer func() {
+                if r := recover(); r != nil {
+                    ch <- LAMMERGEIER.Result.Err(LAMMERGEIER.Error("OtelExportError", fmt.Sprintf("exporter panicked: %v", r), nil))
+                }
+            }()
+            ch <- fn()
+        }()
+        if timeoutMs <= 0 {
+            return <-ch
+        }
+        timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+        defer timer.Stop()
+        select {
+        case r := <-ch:
+            return r
+        case <-timer.C:
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("OtelTimeoutError", fmt.Sprintf("export timed out after %d ms", timeoutMs), nil))
+        }
+    }
+}
+
+class OtelBatchQueue[T] {
+    #- Bounded queue drained in batches by a background ``OtelWorker``;
+    the engine behind ``OtelBatchSpanProcessor`` and
+    ``OtelBatchLogProcessor``. Items beyond ``maxQueueSize`` are dropped
+    (and counted), a full batch wakes the worker early, every
+    ``scheduleDelayMs`` the queue is drained, and each export call is
+    bounded by ``exportTimeoutMs``. Exports never run concurrently. -#
+
+    func init(self, exportFn: func(list[T]) -> Result[OtelExportResult], maxQueueSize: int = 2048, scheduleDelayMs: int = 5000, maxExportBatchSize: int = 512, exportTimeoutMs: int = 30000) {
+        self.exportFn: func(list[T]) -> Result[OtelExportResult] = exportFn
+        self.maxQueueSize: int = maxQueueSize
+        if self.maxQueueSize < 1 {
+            self.maxQueueSize = 2048
+        }
+        self.maxExportBatchSize: int = maxExportBatchSize
+        if self.maxExportBatchSize < 1 or self.maxExportBatchSize > self.maxQueueSize {
+            self.maxExportBatchSize = self.maxQueueSize
+        }
+        self.scheduleDelayMs: int = scheduleDelayMs
+        self.exportTimeoutMs: int = exportTimeoutMs
+        self.items: list[T] = []
+        self.lock: Mutex = Mutex()
+        self.exportLock: Mutex = Mutex()
+        self.closed: bool = false
+        self.droppedCount: int = 0
+        self.exportedCount: int = 0
+        self.failedCount: int = 0
+        self.exportCalls: int = 0
+        self.lastError: str = ""
+        self.worker: OtelWorker = OtelWorker(scheduleDelayMs, self._tick)
+        self.worker.start()
+    }
+
+    func push(self, item: T) -> bool {
+        #- Enqueue ``item``; ``false`` when the queue is full or closed
+        (the item is dropped and counted in ``droppedCount``). -#
+        self.lock.lock()
+        if self.closed or len(self.items) >= self.maxQueueSize {
+            self.droppedCount += 1
+            self.lock.unlock()
+            return false
+        }
+        self.items.append(item)
+        full: bool = len(self.items) >= self.maxExportBatchSize
+        self.lock.unlock()
+        if full {
+            self.worker.wake()
+        }
+        return true
+    }
+
+    func size(self) -> int {
+        #- Number of queued items. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return len(self.items)
+    }
+
+    func dropped(self) -> int {
+        #- Items dropped because the queue was full or closed. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.droppedCount
+    }
+
+    func exported(self) -> int {
+        #- Items handed to successful export calls. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.exportedCount
+    }
+
+    func failed(self) -> int {
+        #- Items whose export call failed or timed out. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.failedCount
+    }
+
+    func lastErrorText(self) -> str {
+        #- The message of the most recent failed export (``""`` if none). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.lastError
+    }
+
+    private func _tick(self) {
+        _ = self.drain()
+    }
+
+    private func _take(self) -> list[T] {
+        self.lock.lock()
+        defer self.lock.unlock()
+        n: int = len(self.items)
+        if n > self.maxExportBatchSize {
+            n = self.maxExportBatchSize
+        }
+        batch: list[T] = self.items[:n]
+        self.items = self.items[n:]
+        return batch
+    }
+
+    func drain(self) -> Result[bool] {
+        #- Export everything currently queued, batch by batch. ``Ok(true)``
+        when every batch was exported, otherwise the last error. -#
+        self.exportLock.lock()
+        defer self.exportLock.unlock()
+        failure: any = None
+        while true {
+            batch: list[T] = self._take()
+            if len(batch) == 0 {
+                break
+            }
+            exportFn: func(list[T]) -> Result[OtelExportResult] = self.exportFn
+            res: Result[OtelExportResult] = otelCallWithTimeout(self.exportTimeoutMs, lambda: exportFn(batch))
+            self.lock.lock()
+            self.exportCalls += 1
+            if res.ok() {
+                self.exportedCount += len(batch)
+            } else {
+                self.failedCount += len(batch)
+                self.lastError = str(res.error)
+                failure = res.error
+            }
+            self.lock.unlock()
+        }
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+
+    func close(self) -> Result[bool] {
+        #- Stop the worker, refuse new items and drain what is queued.
+        Idempotent. -#
+        self.lock.lock()
+        already: bool = self.closed
+        self.closed = true
+        self.lock.unlock()
+        if already {
+            return Result.Ok(true)
+        }
+        self.worker.stop()
+        return self.drain()
+    }
+}
+
+func main() {
+    pass
+}

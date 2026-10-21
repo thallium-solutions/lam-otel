@@ -1,0 +1,641 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconcurrency import Mutex
+from lamerrors import Result, Error
+from lamjson import Json
+from lamtime import Time
+from .core import OtelSdkName, OtelSdkVersion, OtelUtil, OtelResource, OtelConfig, OtelExportResult, OtelOtlpHttp, otelCallWithTimeout, OtelBatchQueue
+from .trace import OtelSpanContext, OtelBatchSpanProcessor
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+
+class OtelSeverity {
+    #- Log severity numbers (the OTLP ``SeverityNumber`` ranges: each level
+    spans four values, e.g. ``INFO`` 9-12). -#
+
+    static UNSPECIFIED: int = 0
+    static TRACE: int = 1
+    static DEBUG: int = 5
+    static INFO: int = 9
+    static WARN: int = 13
+    static ERROR: int = 17
+    static FATAL: int = 21
+
+    static func text(severity: int) -> str {
+        #- ``TRACE``, ``DEBUG``, ``INFO``, ``WARN``, ``ERROR`` or ``FATAL``
+        (with a ``2``-``4`` suffix inside a range, ``""`` for 0). -#
+        if severity <= 0 or severity > 24 {
+            return ""
+        }
+        names: list[str] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
+        idx: int = (severity - 1) // 4
+        offset: int = (severity - 1) % 4
+        if offset == 0 {
+            return names[idx]
+        }
+        return names[idx] + str(offset + 1)
+    }
+
+    static func parse(name: str) -> int {
+        #- A level name (``"info"``, ``"WARNING"``, ``"error"``...) as a
+        severity number (``UNSPECIFIED`` when unknown). -#
+        n: str = name.trim().toUpper()
+        if n == "TRACE" {
+            return OtelSeverity.TRACE
+        }
+        if n == "DEBUG" {
+            return OtelSeverity.DEBUG
+        }
+        if n == "INFO" {
+            return OtelSeverity.INFO
+        }
+        if n == "WARN" or n == "WARNING" {
+            return OtelSeverity.WARN
+        }
+        if n == "ERROR" {
+            return OtelSeverity.ERROR
+        }
+        if n == "FATAL" or n == "CRITICAL" {
+            return OtelSeverity.FATAL
+        }
+        return OtelSeverity.UNSPECIFIED
+    }
+}
+
+class OtelLogRecord {
+    #- One log record: timestamps (Unix nanoseconds), severity, ``body``
+    (a string or any attribute-compatible value), attributes, the trace
+    and span ids it is correlated with, and the emitting resource/scope. -#
+
+    func init(self, body: any = None, severity: int = 9) {
+        self.timeUnixNano: int = Time.nowUnixNano()
+        self.observedTimeUnixNano: int = self.timeUnixNano
+        self.severityNumber: int = severity
+        self.severityText: str = OtelSeverity.text(severity)
+        self.body: any = body
+        self.attributes: dict[str, any] = {}
+        self.droppedAttributesCount: int = 0
+        self.eventName: str = ""
+        self.traceId: str = ""
+        self.spanId: str = ""
+        self.traceFlags: int = 0
+        self.resource: OtelResource = OtelResource.sdkDefaults()
+        self.scopeName: str = OtelSdkName
+        self.scopeVersion: str = OtelSdkVersion
+    }
+
+    func bodyString(self) -> str {
+        #- The body formatted as a string (``""`` for ``None``). -#
+        if self.body == None {
+            return ""
+        }
+        return str(self.body)
+    }
+
+    func toJson(self) -> json {
+        #- The OTLP/JSON ``LogRecord`` message. -#
+        out: json = {
+            "timeUnixNano": str(self.timeUnixNano),
+            "observedTimeUnixNano": str(self.observedTimeUnixNano),
+            "severityNumber": self.severityNumber,
+            "severityText": self.severityText,
+            "body": OtelUtil.anyValueJson(self.body),
+            "attributes": OtelUtil.attributesJson(self.attributes),
+            "droppedAttributesCount": self.droppedAttributesCount,
+            "flags": self.traceFlags,
+        }
+        if self.traceId != "" {
+            out["traceId"] = self.traceId
+            out["spanId"] = self.spanId
+        }
+        if self.eventName != "" {
+            out["eventName"] = self.eventName
+        }
+        return out
+    }
+}
+
+class OtelLogJson {
+    #- OTLP/JSON encoding of log records (``ExportLogsServiceRequest``). -#
+
+    static func payload(records: list[OtelLogRecord]) -> json {
+        #- Group ``records`` by resource and scope as ``{"resourceLogs": [...]}``. -#
+        resourceOrder: list[str] = []
+        resources: dict[str, OtelResource] = {}
+        scopeOrder: dict[str, list[str]] = {}
+        scopeRecords: dict[str, list[json]] = {}
+        scopeNames: dict[str, str] = {}
+        scopeVersions: dict[str, str] = {}
+        for item in records {
+            rec: OtelLogRecord = item
+            rkey: str = rec.resource.key()
+            if rkey not in resources {
+                resources[rkey] = rec.resource
+                resourceOrder.append(rkey)
+                scopeOrder[rkey] = []
+            }
+            skey: str = rkey + "\x1d" + rec.scopeName + "\x1d" + rec.scopeVersion
+            if skey not in scopeRecords {
+                scopeRecords[skey] = []
+                scopeNames[skey] = rec.scopeName
+                scopeVersions[skey] = rec.scopeVersion
+                order: list[str] = scopeOrder[rkey]
+                order.append(skey)
+                scopeOrder[rkey] = order
+            }
+            encoded: list[json] = scopeRecords[skey]
+            encoded.append(rec.toJson())
+            scopeRecords[skey] = encoded
+        }
+        out: list[json] = []
+        for rkey in resourceOrder {
+            scopes: list[json] = []
+            for skey in scopeOrder[rkey] {
+                scopes.append({"scope": {"name": scopeNames[skey], "version": scopeVersions[skey]}, "logRecords": scopeRecords[skey]})
+            }
+            res: OtelResource = resources[rkey]
+            out.append({"resource": res.toJson(), "scopeLogs": scopes})
+        }
+        return {"resourceLogs": out}
+    }
+}
+
+interface OtelLogProcessor {
+    #- Hooks for log records: ``onEmit`` for every record that passed the
+    severity filter, ``forceFlush`` and ``shutdown`` from the provider. -#
+    func onEmit(self, record: OtelLogRecord)
+    func forceFlush(self) -> Result[bool]
+    func shutdown(self) -> Result[bool]
+}
+
+interface OtelLogExporter {
+    #- Destination for log records: ``export`` receives one batch at a
+    time and ``shutdown`` releases resources. -#
+    func export(self, records: list[OtelLogRecord]) -> Result[OtelExportResult]
+    func shutdown(self) -> Result[bool]
+}
+
+class OtelOtlpLogExporter {
+    #- Exports log records as OTLP/HTTP JSON to ``logsUrl()`` of the
+    configuration (headers, timeout, compression, retries). -#
+
+    func init(self, cfg: OtelConfig = None) {
+        c: OtelConfig = cfg if cfg != None else OtelConfig.fromEnv()
+        self.transport: OtelOtlpHttp = OtelOtlpHttp.forSignal(c, "logs")
+        self.stopped: bool = false
+    }
+
+    func export(self, records: list[OtelLogRecord]) -> Result[OtelExportResult] {
+        #- POST ``records``. -#
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "log exporter is shut down", None))
+        }
+        if len(records) == 0 {
+            return Result.Ok(OtelExportResult(0, "", 0, 0))
+        }
+        return self.transport.send(OtelLogJson.payload(records), len(records))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports. -#
+        self.stopped = true
+        return Result.Ok(true)
+    }
+}
+
+class OtelInMemoryLogExporter {
+    #- Keeps exported log records in memory: the exporter to use in tests. -#
+
+    func init(self) {
+        self.records: list[OtelLogRecord] = []
+        self.stopped: bool = false
+        self.lock: Mutex = Mutex()
+    }
+
+    func export(self, records: list[OtelLogRecord]) -> Result[OtelExportResult] {
+        #- Append ``records``. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "log exporter is shut down", None))
+        }
+        for r in records {
+            self.records.append(r)
+        }
+        return Result.Ok(OtelExportResult(0, "", 1, len(records)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports (records stay readable). -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.stopped = true
+        return Result.Ok(true)
+    }
+
+    func finishedRecords(self) -> list[OtelLogRecord] {
+        #- A copy of the exported records, in order. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        out: list[OtelLogRecord] = []
+        for r in self.records {
+            out.append(r)
+        }
+        return out
+    }
+
+    func count(self) -> int {
+        #- Number of exported records. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return len(self.records)
+    }
+
+    func bodies(self) -> list[str] {
+        #- The record bodies as strings, in order. -#
+        out: list[str] = []
+        for r in self.finishedRecords() {
+            out.append(r.bodyString())
+        }
+        return out
+    }
+
+    func reset(self) {
+        #- Forget the exported records. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.records = []
+    }
+}
+
+class OtelConsoleLogExporter {
+    #- Writes every log record as one JSON line (the OTLP record plus its
+    scope) to standard output, or to ``out`` when given. -#
+
+    func init(self, out: func(str) = None) {
+        self.out: func(str) = out
+        self.stopped: bool = false
+    }
+
+    func export(self, records: list[OtelLogRecord]) -> Result[OtelExportResult] {
+        #- Write one line per record. -#
+        if self.stopped {
+            return Result.Err(Error("OtelShutdownError", "log exporter is shut down", None))
+        }
+        for r in records {
+            doc: json = {"scope": {"name": r.scopeName, "version": r.scopeVersion}, "logRecord": r.toJson()}
+            line: str = Json.encode(doc).unwrapOr("{}")
+            if self.out == None {
+                print(line)
+            } else {
+                writer: func(str) = self.out
+                writer(line)
+            }
+        }
+        return Result.Ok(OtelExportResult(0, "", 1, len(records)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Refuse further exports. -#
+        self.stopped = true
+        return Result.Ok(true)
+    }
+}
+
+class OtelSimpleLogProcessor {
+    #- Exports every record synchronously when it is emitted. -#
+
+    func init(self, exporter: OtelLogExporter) {
+        self.exporter: OtelLogExporter = exporter
+        self.lock: Mutex = Mutex()
+        self.stopped: bool = false
+        self.failedCount: int = 0
+        self.lastError: str = ""
+    }
+
+    func onEmit(self, record: OtelLogRecord) {
+        #- Export ``record``. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        if self.stopped {
+            return
+        }
+        batch: list[OtelLogRecord] = [record]
+        exporter: OtelLogExporter = self.exporter
+        res: Result[OtelExportResult] = otelCallWithTimeout(0, lambda: exporter.export(batch))
+        if not res.ok() {
+            self.failedCount += 1
+            self.lastError = str(res.error)
+        }
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Nothing is buffered: always ``Ok(true)``. -#
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Shut the exporter down. Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        self.lock.unlock()
+        return self.exporter.shutdown()
+    }
+}
+
+class OtelBatchLogProcessor {
+    #- Buffers log records and exports them in batches from a background
+    goroutine (same behaviour as ``OtelBatchSpanProcessor``; settings from
+    ``OTEL_BLRP_*``). -#
+
+    func init(self, exporter: OtelLogExporter, maxQueueSize: int = 2048, scheduleDelayMs: int = 1000, maxExportBatchSize: int = 512, exportTimeoutMs: int = 30000) {
+        self.exporter: OtelLogExporter = exporter
+        self.queue: OtelBatchQueue[OtelLogRecord] = OtelBatchQueue[OtelLogRecord](self._export, maxQueueSize, scheduleDelayMs, maxExportBatchSize, exportTimeoutMs)
+        self.stopped: bool = false
+        self.lock: Mutex = Mutex()
+    }
+
+    static func fromConfig(exporter: OtelLogExporter, cfg: OtelConfig) -> OtelBatchLogProcessor {
+        #- A processor using the ``OTEL_BLRP_*`` settings of ``cfg``. -#
+        return OtelBatchLogProcessor(exporter, cfg.blrpMaxQueueSize, cfg.blrpScheduleDelayMs, cfg.blrpMaxExportBatchSize, cfg.blrpExportTimeoutMs)
+    }
+
+    private func _export(self, records: list[OtelLogRecord]) -> Result[OtelExportResult] {
+        return self.exporter.export(records)
+    }
+
+    func onEmit(self, record: OtelLogRecord) {
+        #- Queue ``record``. -#
+        _ = self.queue.push(record)
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Export everything queued now. -#
+        return self.queue.drain()
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Stop the worker, export what is queued and shut the exporter
+        down. Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        self.lock.unlock()
+        flushed: Result[bool] = self.queue.close()
+        closed: Result[bool] = self.exporter.shutdown()
+        if not flushed.ok() {
+            return flushed
+        }
+        return closed
+    }
+
+    func queued(self) -> int {
+        #- Records waiting for export. -#
+        return self.queue.size()
+    }
+
+    func dropped(self) -> int {
+        #- Records dropped because the queue was full. -#
+        return self.queue.dropped()
+    }
+
+    func exported(self) -> int {
+        #- Records exported successfully. -#
+        return self.queue.exported()
+    }
+
+    func failed(self) -> int {
+        #- Records whose export failed. -#
+        return self.queue.failed()
+    }
+}
+
+class OtelLoggerProvider {
+    #- Owns the logs pipeline: resource, attribute limits, minimum
+    severity and log processors. -#
+
+    func init(self, resource: OtelResource = None, attributeCountLimit: int = 128, attributeValueLengthLimit: int = -1) {
+        self.resource: OtelResource = resource if resource != None else OtelResource.sdkDefaults()
+        self.attributeCountLimit: int = attributeCountLimit
+        self.attributeValueLengthLimit: int = attributeValueLengthLimit
+        self.minSeverity: int = 0
+        self.processors: list[OtelLogProcessor] = []
+        self.loggers: dict[str, OtelLogger] = {}
+        self.enabled: bool = true
+        self.stopped: bool = false
+        self.config: OtelConfig = None
+        self.lock: Mutex = Mutex()
+    }
+
+    static func fromConfig(cfg: OtelConfig) -> OtelLoggerProvider {
+        #- A provider for ``cfg`` with, per ``OTEL_LOGS_EXPORTER``, a batch
+        processor exporting over OTLP (``otlp``, default), a simple processor
+        writing to the console (``console``), or none (``none``). -#
+        countLimit: int = cfg.logRecordAttributeCountLimit
+        if countLimit == -2 {
+            countLimit = cfg.attributeCountLimit
+        }
+        lengthLimit: int = cfg.logRecordAttributeValueLengthLimit
+        if lengthLimit == -2 {
+            lengthLimit = cfg.attributeValueLengthLimit
+        }
+        p: OtelLoggerProvider = OtelLoggerProvider(cfg.resource(), countLimit, lengthLimit)
+        p.config = cfg
+        if cfg.disabled {
+            p.enabled = false
+            return p
+        }
+        for name in cfg.exporterFor("logs").split(",") {
+            n: str = name.trim()
+            if n == "otlp" {
+                p.addProcessor(OtelBatchLogProcessor.fromConfig(OtelOtlpLogExporter(cfg), cfg))
+            } elif n == "console" {
+                p.addProcessor(OtelSimpleLogProcessor(OtelConsoleLogExporter()))
+            }
+        }
+        return p
+    }
+
+    static func fromEnv() -> OtelLoggerProvider {
+        #- ``fromConfig(OtelConfig.fromEnv())``. -#
+        return OtelLoggerProvider.fromConfig(OtelConfig.fromEnv())
+    }
+
+    static func noop() -> OtelLoggerProvider {
+        #- A provider that discards every record. -#
+        p: OtelLoggerProvider = OtelLoggerProvider()
+        p.enabled = false
+        return p
+    }
+
+    func addProcessor(self, processor: OtelLogProcessor) {
+        #- Register a log processor. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        self.processors.append(processor)
+    }
+
+    func setMinSeverity(self, severity: int) {
+        #- Discard records below ``severity`` (``0`` keeps everything). -#
+        self.minSeverity = severity
+    }
+
+    func logger(self, name: str = "", version: str = "") -> OtelLogger {
+        #- The logger for instrumentation scope ``name``/``version``. -#
+        key: str = name + "@" + version
+        self.lock.lock()
+        defer self.lock.unlock()
+        if key in self.loggers {
+            return self.loggers[key]
+        }
+        l: OtelLogger = OtelLogger(self, name, version)
+        self.loggers[key] = l
+        return l
+    }
+
+    func processorList(self) -> list[OtelLogProcessor] {
+        #- A copy of the registered processors. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        out: list[OtelLogProcessor] = []
+        for p in self.processors {
+            out.append(p)
+        }
+        return out
+    }
+
+    func isShutdown(self) -> bool {
+        #- True after ``shutdown()``. -#
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.stopped
+    }
+
+    func forceFlush(self) -> Result[bool] {
+        #- Flush every processor. -#
+        failure: any = None
+        for p in self.processorList() {
+            res: Result[bool] = p.forceFlush()
+            if not res.ok() and failure == None {
+                failure = res.error
+            }
+        }
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+
+    func shutdown(self) -> Result[bool] {
+        #- Shut every processor down (flushing them). Idempotent. -#
+        self.lock.lock()
+        if self.stopped {
+            self.lock.unlock()
+            return Result.Ok(true)
+        }
+        self.stopped = true
+        self.lock.unlock()
+        failure: any = None
+        for p in self.processorList() {
+            res: Result[bool] = p.shutdown()
+            if not res.ok() and failure == None {
+                failure = res.error
+            }
+        }
+        if failure != None {
+            return Result.Err(failure)
+        }
+        return Result.Ok(true)
+    }
+}
+
+class OtelLogger {
+    #- Emits log records for one instrumentation scope. Pass a span
+    context (``span.spanContext()``) to correlate a record with a trace. -#
+
+    func init(self, provider: OtelLoggerProvider, name: str = "", version: str = "") {
+        self.provider: OtelLoggerProvider = provider
+        self.name: str = name if name != "" else OtelSdkName
+        self.version: str = version if name != "" else OtelSdkVersion
+    }
+
+    func enabled(self, severity: int = 0) -> bool {
+        #- True when a record of ``severity`` would be processed. -#
+        p: OtelLoggerProvider = self.provider
+        return p.enabled and not p.isShutdown() and severity >= p.minSeverity and len(p.processorList()) > 0
+    }
+
+    func emit(self, severity: int, body: any, attributes: dict[str, any] = {}, context: OtelSpanContext = None, timeUnixNano: int = 0, eventName: str = "") {
+        #- Build a record (``body`` may be a string or any attribute-like
+        value, ``timeUnixNano`` 0 = now) and hand it to the processors;
+        records below the minimum severity are discarded. -#
+        if not self.enabled(severity) {
+            return
+        }
+        rec: OtelLogRecord = OtelLogRecord(body, severity)
+        if timeUnixNano > 0 {
+            rec.timeUnixNano = timeUnixNano
+        }
+        rec.eventName = eventName
+        for k in OtelUtil.sortedKeys(attributes) {
+            if not OtelUtil.setLimited(rec.attributes, k, attributes[k], self.provider.attributeCountLimit, self.provider.attributeValueLengthLimit) {
+                rec.droppedAttributesCount += 1
+            }
+        }
+        if context != None and context.isValid() {
+            rec.traceId = context.traceId
+            rec.spanId = context.spanId
+            rec.traceFlags = context.traceFlags
+        }
+        rec.resource = self.provider.resource
+        rec.scopeName = self.name
+        rec.scopeVersion = self.version
+        for p in self.provider.processorList() {
+            p.onEmit(rec)
+        }
+    }
+
+    func trace(self, message: str, attributes: dict[str, any] = {}, context: OtelSpanContext = None) {
+        #- Emit a ``TRACE`` record. -#
+        self.emit(OtelSeverity.TRACE, message, attributes, context)
+    }
+
+    func debug(self, message: str, attributes: dict[str, any] = {}, context: OtelSpanContext = None) {
+        #- Emit a ``DEBUG`` record. -#
+        self.emit(OtelSeverity.DEBUG, message, attributes, context)
+    }
+
+    func info(self, message: str, attributes: dict[str, any] = {}, context: OtelSpanContext = None) {
+        #- Emit an ``INFO`` record. -#
+        self.emit(OtelSeverity.INFO, message, attributes, context)
+    }
+
+    func warn(self, message: str, attributes: dict[str, any] = {}, context: OtelSpanContext = None) {
+        #- Emit a ``WARN`` record. -#
+        self.emit(OtelSeverity.WARN, message, attributes, context)
+    }
+
+    func error(self, message: str, attributes: dict[str, any] = {}, context: OtelSpanContext = None) {
+        #- Emit an ``ERROR`` record. -#
+        self.emit(OtelSeverity.ERROR, message, attributes, context)
+    }
+
+    func fatal(self, message: str, attributes: dict[str, any] = {}, context: OtelSpanContext = None) {
+        #- Emit a ``FATAL`` record (the process is not terminated). -#
+        self.emit(OtelSeverity.FATAL, message, attributes, context)
+    }
+}
+
+func main() {
+    pass
+}
