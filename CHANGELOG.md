@@ -3,6 +3,12 @@
 All notable changes to `@lam/otel` are documented here. The package follows
 semantic versioning; tags are plain versions (`1.0.0`).
 
+## [1.1.1] - 2026-11-03
+
+### Changed
+
+- Compatible with `lamc` 4.x: `compatibility.lamc = ">=3.0, <5"` (test runner too).
+
 ## [1.1.0] - 2026-10-21
 
 ### Changed
