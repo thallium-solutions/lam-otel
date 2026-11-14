@@ -44,7 +44,7 @@ your project's `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/otel" = { git = "https://github.com/thallium-solutions/lam-otel.git", ref = "1.1.0" }
+"@lam/otel" = { git = "https://github.com/thallium-solutions/lam-otel.git", ref = "1.1.2" }
 ```
 
 and install it:

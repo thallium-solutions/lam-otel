@@ -1,6 +1,6 @@
 [library]
 name = "@lam/otel"
-version = "1.1.1"
+version = "1.1.2"
 description = "OpenTelemetry tracing, metrics and logs over OTLP/HTTP JSON for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]

@@ -381,7 +381,8 @@ class OtelBaggage {
                 member = member + ";" + self.metadata[k]
             }
             candidate: str = member if out == "" else out + "," + member
-            if len(candidate) > OtelBaggage.MAX_BYTES {
+            # W3C limits are in bytes (len(str) counts characters since lamc 4.14).
+            if len(bytes(candidate)) > OtelBaggage.MAX_BYTES {
                 continue
             }
             out = candidate
@@ -393,7 +394,7 @@ class OtelBaggage {
         #- Parse a ``baggage`` header. Malformed members are skipped and
         values are percent-decoded. -#
         out: OtelBaggage = OtelBaggage()
-        if len(value) > OtelBaggage.MAX_BYTES * 2 {
+        if len(bytes(value)) > OtelBaggage.MAX_BYTES * 2 {
             return out
         }
         for raw in value.split(",") {

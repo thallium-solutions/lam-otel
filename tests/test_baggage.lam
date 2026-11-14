@@ -13,6 +13,8 @@
 # expect: special values a%2Cb%3Bc%3D%25 -> a,b;c=%
 # expect: member limit 180
 # expect: byte limit under 8192 true
+# expect: non-ASCII metadata counted in bytes: kept=[a] header-bytes=true
+# expect: oversized non-ASCII header ignored 0 fitting one parsed 1
 # expect: propagator fields [traceparent tracestate baggage]
 # expect: only baggage [baggage] trace-invalid true baggage alice
 # expect: none [] nothing-written 0
@@ -59,6 +61,13 @@ func main() {
         big.set("key" + str(i), "x" * 200)
     }
     print("byte limit under 8192", len(big.toHeader()) <= 8192)
+    # The W3C limits count bytes: 5000 "é" are 5000 characters, 10000 bytes.
+    wide: OtelBaggage = OtelBaggage()
+    wide.set("a", "1", "note=" + "é" * 2000)
+    wide.set("b", "2", "note=" + "é" * 5000)
+    wideHeader: str = wide.toHeader()
+    print(f"non-ASCII metadata counted in bytes: kept=[{','.join([part.split('=')[0] for part in wideHeader.split(',')])}] header-bytes={len(bytes(wideHeader)) <= 8192}")
+    print("oversized non-ASCII header ignored", OtelBaggage.fromHeader("k=v;note=" + "é" * 9000).size(), "fitting one parsed", OtelBaggage.fromHeader("k=v;note=" + "é" * 4000).size())
 
     p: OtelPropagator = OtelPropagator.parse("tracecontext, baggage, b3")
     print("propagator fields", p.fields())

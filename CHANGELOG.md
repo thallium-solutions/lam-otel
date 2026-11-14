@@ -3,6 +3,20 @@
 All notable changes to `@lam/otel` are documented here. The package follows
 semantic versioning; tags are plain versions (`1.0.0`).
 
+## [1.1.2] - 2026-11-14
+
+### Fixed
+
+- W3C Baggage limits count bytes, as the specification says: `toHeader()`
+  leaves out members that would push the header past 8192 bytes, and
+  `fromHeader()` ignores a header over 16384 bytes, measured with
+  `len(bytes(...))`. They used `len(str)`, which counts characters from lamc
+  4.14 on (strings are sequences of characters), so non-ASCII metadata could
+  make headers longer than the limit. Correct with lamc 4.13 and 4.14; tested
+  with non-ASCII metadata. The attribute value length limit still counts
+  characters (the OpenTelemetry specification); its truncation cuts between
+  characters, never inside a UTF-8 sequence, with either compiler.
+
 ## [1.1.1] - 2026-11-03
 
 ### Changed
