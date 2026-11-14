@@ -3,6 +3,31 @@
 All notable changes to `@lam/otel` are documented here. The package follows
 semantic versioning; tags are plain versions (`1.0.0`).
 
+## [1.1.3] - 2026-11-14
+
+### Tests
+
+- `tests/test_concurrent_telemetry_composed.lam`: traces, metrics and logs
+  recorded by 50 async tasks through an `OrderService` class sharing one
+  tracer, meter and logger: child spans of a shared root and nested
+  `withSpan` spans (every tenth throws: exception event, status `ERROR`,
+  exception re-raised), each span exported once with a unique id, counter,
+  histogram and log totals, correlated log records, attribute truncation by
+  characters on non-ASCII values, and propagation of the root context and
+  non-ASCII baggage.
+- `tests/test_global_api_gaps.lam`: no-op global providers before setup,
+  `Otel.setTracerProvider`/`setMeterProvider`/`setLoggerProvider`, global
+  `forceFlush`/`shutdown`, `traceparent()`, `isEnded`, the in-memory
+  exporters' `reset`/`latest`/`exportCount`, `OtelMetricPoint.value()`,
+  `OtelLogger.trace`, `parsePairs`/`parseHeaders` and OTLP/JSON payloads with
+  non-ASCII names.
+- `tests/test_processors.lam`: the batch-queue overflow check is
+  deterministic. A full queue wakes the worker, so the worker sometimes
+  exported the first 5 spans before the burst ended and fewer were dropped
+  (`overflow queued 1 dropped 2`, 2 failures in 40 runs); a gated exporter
+  now holds the worker in its first export while the queue overflows (0
+  failures in 40 runs).
+
 ## [1.1.2] - 2026-11-14
 
 ### Fixed

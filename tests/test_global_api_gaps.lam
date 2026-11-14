@@ -1,0 +1,92 @@
+# The global `Otel` entry points and the inspection helpers no other test
+# calls: no-op providers before setup, `setTracerProvider` /
+# `setMeterProvider` / `setLoggerProvider` and their getters, global
+# `forceFlush` and `shutdown`, `traceparent()` (sampled, unsampled, invalid),
+# `isEnded`, the in-memory exporters' `reset` / `latest` / `exportCount`,
+# `OtelMetricPoint.value()`, `OtelLogger.trace`, `parsePairs` /
+# `parseHeaders` (trimming, `=` in values, percent-decoded UTF-8, skipped
+# members), and OTLP/JSON payloads with non-ASCII names.
+#
+# expect: before setup: recording=false
+# expect: isEnded: false true
+# expect: global tracer: exported 1 same provider true
+# expect: traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00 ""
+# expect: span reset: 0
+# expect: metrics: exports 2 latest 1 value 7.5 int 3 reset 0
+# expect: trace log: 1 TRACE
+# expect: global flush and shutdown: true true recording-after=false
+# expect: pairs: a=1 b=x y c=k=v d=✓ count=4
+# expect: headers: authorization=Bearer t0k=n x-tenant=zoë
+# expect: payloads: naïve 🦅 ventes € journal ✓
+# expect: ok
+
+from @lam/otel import Otel, OtelTracerProvider, OtelTracer, OtelSpan, OtelSpanContext, OtelSimpleSpanProcessor, OtelInMemorySpanExporter, OtelMeterProvider, OtelMeter, OtelMetricReader, OtelInMemoryMetricExporter, OtelMetricData, OtelMetricPoint, OtelLoggerProvider, OtelLogger, OtelLogRecord, OtelInMemoryLogExporter, OtelSimpleLogProcessor, OtelResource
+from lamjson import Json
+
+func main() {
+    early: OtelSpan = Otel.tracer("early").startSpan("ignored")
+    early.end()
+    print(f"before setup: recording={early.isRecording()}")
+
+    spans: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    tracing: OtelTracerProvider = OtelTracerProvider(OtelResource({"service.name": "naïve 🦅"}))
+    tracing.addProcessor(OtelSimpleSpanProcessor(spans))
+    Otel.setTracerProvider(tracing)
+    globalSpan: OtelSpan = Otel.tracer("global", "1").startSpan("naïve 🦅")
+    endedBefore: bool = globalSpan.isEnded()
+    globalSpan.end()
+    print(f"isEnded: {endedBefore} {globalSpan.isEnded()}")
+    print(f"global tracer: exported {spans.count()} same provider {Otel.tracerProvider() == tracing}")
+
+    sampled: OtelSpanContext = OtelSpanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 1)
+    unsampled: OtelSpanContext = OtelSpanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", 0)
+    print(f"traceparent: {sampled.traceparent()} {unsampled.traceparent()} \"{OtelSpanContext.invalid().traceparent()}\"")
+
+    payloadSpans: list[OtelSpan] = spans.finishedSpans()
+    spans.reset()
+    print(f"span reset: {spans.count()}")
+
+    metricsOut: OtelInMemoryMetricExporter = OtelInMemoryMetricExporter()
+    reader: OtelMetricReader = OtelMetricReader(metricsOut, 0)
+    metering: OtelMeterProvider = OtelMeterProvider()
+    metering.addReader(reader)
+    Otel.setMeterProvider(metering)
+    meter: OtelMeter = Otel.meter("ventes €")
+    meter.gauge("load").recordFloat(7.5)
+    meter.counter("hits").add(3)
+    _ = reader.forceFlush()
+    _ = reader.forceFlush()
+    latest: list[OtelMetricData] = metricsOut.latest()
+    gauge: OtelMetricData = metricsOut.find("load")
+    hits: OtelMetricData = metricsOut.find("hits")
+    exports: int = metricsOut.exportCount()
+    metricsOut.reset()
+    print(f"metrics: exports {exports} latest {len([m for m in latest if m.name == 'load'])} value {gauge.points[0].value()} int {int(hits.points[0].value())} reset {metricsOut.exportCount()}")
+
+    logsOut: OtelInMemoryLogExporter = OtelInMemoryLogExporter()
+    logging: OtelLoggerProvider = OtelLoggerProvider()
+    logging.addProcessor(OtelSimpleLogProcessor(logsOut))
+    Otel.setLoggerProvider(logging)
+    Otel.logger("journal ✓").trace("very detailed")
+    records: list[OtelLogRecord] = logsOut.finishedRecords()
+    print(f"trace log: {len(records)} {records[0].severityText}")
+
+    flushed: bool = Otel.forceFlush().ok()
+    shut: bool = Otel.shutdown().ok()
+    late: OtelSpan = Otel.tracer("global").startSpan("after shutdown")
+    print(f"global flush and shutdown: {flushed} {shut} recording-after={late.isRecording()}")
+
+    pairs: dict[str, str] = Otel.parsePairs(" a = 1 , b=x%20y,c=k=v,=skipped,noequals, d=%E2%9C%93 ")
+    print(f"pairs: a={pairs['a']} b={pairs['b']} c={pairs['c']} d={pairs['d']} count={len(pairs)}")
+    headers: dict[str, str] = Otel.parseHeaders("authorization=Bearer%20t0k=n,x-tenant=zo%C3%AB")
+    print(f"headers: authorization={headers['authorization']} x-tenant={headers['x-tenant']}")
+
+    traces: json = Otel.tracesPayload(payloadSpans)
+    spanName: str = traces.resourceSpans[0].scopeSpans[0].spans[0].name
+    metricsJson: json = Otel.metricsPayload(OtelResource({"service.name": "x"}), latest)
+    scope: str = metricsJson.resourceMetrics[0].scopeMetrics[0].scope.name
+    logsJson: json = Otel.logsPayload(records)
+    logScope: str = logsJson.resourceLogs[0].scopeLogs[0].scope.name
+    print(f"payloads: {spanName} {scope} {logScope}")
+    print("ok")
+}

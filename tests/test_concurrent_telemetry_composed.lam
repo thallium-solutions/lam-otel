@@ -1,0 +1,139 @@
+# Cross-feature: traces, metrics and logs recorded concurrently by 50 async
+# tasks sharing one tracer, meter and logger. Each task handles an order
+# in a child span of a shared root span and a nested `withSpan` (every
+# tenth throws: the span records the exception, gets status ERROR and the
+# exception reaches the task's `try/catch`), adds to a counter, records a
+# histogram value and emits a correlated log record. Then: every span is
+# exported once by the batch processor with unique ids under the root
+# trace; counter, histogram and log totals match; non-ASCII attribute values
+# are truncated by characters; the root context and non-ASCII baggage
+# survive header propagation; results are checked with comprehensions and
+# an `OrderService` class.
+#
+# expect: tasks: 50 handled, 5 failed
+# expect: spans exported: 101 unique ids 101 one trace true
+# expect: children of root: 50 nested under children: 50
+# expect: failed spans: 5 with exception events: 5 message: ValueError: order 9 failed
+# expect: counter: 50 [eu:17 us:17 apac:16]
+# expect: histogram: count 50 sum 1225 min 0 max 49
+# expect: logs: 50 correlated 50 severity INFO
+# expect: truncated by characters: été🦅日 [Zoë🦅東 ok]
+# expect: propagated: true baggage Zoë 🦅 東京
+# expect: shutdown: true true true
+# expect: ok
+
+from @lam/otel import OtelTracerProvider, OtelTracer, OtelSpan, OtelSpanKind, OtelSpanLimits, OtelSpanContext, OtelResource, OtelSampler, OtelBatchSpanProcessor, OtelInMemorySpanExporter, OtelMeterProvider, OtelMeter, OtelCounter, OtelHistogram, OtelMetricReader, OtelInMemoryMetricExporter, OtelMetricData, OtelMetricPoint, OtelLoggerProvider, OtelLogger, OtelLogRecord, OtelInMemoryLogExporter, OtelSimpleLogProcessor, OtelBaggage, Otel
+from lamerrors import Result
+
+class OrderService {
+    func init(self, tracer: OtelTracer, orders: OtelCounter, amounts: OtelHistogram, logger: OtelLogger) {
+        self.tracer: OtelTracer = tracer
+        self.orders: OtelCounter = orders
+        self.amounts: OtelHistogram = amounts
+        self.logger: OtelLogger = logger
+    }
+
+    func handle(self, root: OtelSpanContext, i: int) -> bool {
+        span: OtelSpan = self.tracer.startSpan(f"order {i}", OtelSpanKind.INTERNAL, root, {"order.id": i, "customer": "Zoë 🦅"})
+        region: str = ["eu", "us", "apac"][i % 3]
+        ok: bool = true
+        try {
+            self.tracer.withSpan(f"charge {i}", lambda (inner: OtelSpan) -> None {
+                inner.setAttribute("amount", i)
+                if i % 10 == 9 {
+                    throw ValueError(f"order {i} failed")
+                }
+            }, OtelSpanKind.CLIENT, span.spanContext())
+        } catch ValueError as _e {
+            ok = false
+        }
+        self.orders.add(1, {"region": region})
+        self.amounts.record(i, {"region": region})
+        self.logger.info(f"order {i} handled", {"ok": ok}, span.spanContext())
+        span.end()
+        return ok
+    }
+}
+
+async func handleTask(service: OrderService, root: OtelSpanContext, i: int) -> bool {
+    return service.handle(root, i)
+}
+
+func main() {
+    spans: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
+    batch: OtelBatchSpanProcessor = OtelBatchSpanProcessor(spans, 1000, 60000, 64, 5000)
+    tracing: OtelTracerProvider = OtelTracerProvider(OtelResource({"service.name": "shop"}), OtelSampler.alwaysOn(), OtelSpanLimits(attributeValueLengthLimit=5))
+    tracing.addProcessor(batch)
+    tracer: OtelTracer = tracing.tracer("orders", "1.0")
+
+    metricsOut: OtelInMemoryMetricExporter = OtelInMemoryMetricExporter()
+    reader: OtelMetricReader = OtelMetricReader(metricsOut, 0)
+    metering: OtelMeterProvider = OtelMeterProvider()
+    metering.addReader(reader)
+    meter: OtelMeter = metering.meter("orders")
+
+    logsOut: OtelInMemoryLogExporter = OtelInMemoryLogExporter()
+    logging: OtelLoggerProvider = OtelLoggerProvider()
+    logging.addProcessor(OtelSimpleLogProcessor(logsOut))
+
+    service: OrderService = OrderService(tracer, meter.counter("orders"), meter.histogram("order.amount", "", "", [10.0, 25.0]), logging.logger("orders"))
+    root: OtelSpan = tracer.startSpan("checkout 🛒", OtelSpanKind.SERVER)
+    pending = [handleTask(service, root.spanContext(), i) for i in range(50)]
+    outcomes: list[bool] = []
+    for task in pending {
+        outcomes.append(await task)
+    }
+    root.end()
+    print(f"tasks: {len(outcomes)} handled, {len([o for o in outcomes if not o])} failed")
+
+    _ = batch.forceFlush()
+    exported: list[OtelSpan] = spans.finishedSpans()
+    print(f"spans exported: {len(exported)} unique ids {len(set([s.spanId for s in exported]))} one trace {exported.all(lambda s: s.traceId == root.traceId)}")
+    children: list[OtelSpan] = [s for s in exported if s.parentSpanId == root.spanId]
+    childIds: set[str] = set([s.spanId for s in children])
+    print(f"children of root: {len(children)} nested under children: {len([s for s in exported if s.parentSpanId in childIds])}")
+    failed: list[OtelSpan] = [s for s in exported if s.statusCode == 2]
+    messages: list[str] = sorted([s.statusMessage for s in failed])
+    print(f"failed spans: {len(failed)} with exception events: {len([s for s in failed if len(s.events) > 0 and s.events[0].name == 'exception'])} message: {messages[len(messages) - 1]}")
+
+    _ = reader.forceFlush()
+    counter: OtelMetricData = metricsOut.find("orders")
+    byRegion: dict[str, int] = {}
+    total: int = 0
+    for point in counter.points {
+        region: str = str(point.attributes["region"])
+        byRegion[region] = point.intValue
+        total += point.intValue
+    }
+    print(f"counter: {total} [eu:{byRegion['eu']} us:{byRegion['us']} apac:{byRegion['apac']}]")
+    histogram: OtelMetricData = metricsOut.find("order.amount")
+    count: int = 0
+    sum: float = 0.0
+    low: float = 1000.0
+    high: float = -1.0
+    for point in histogram.points {
+        count += point.count
+        sum += point.sum
+        low = point.min if point.min < low else low
+        high = point.max if point.max > high else high
+    }
+    print(f"histogram: count {count} sum {int(sum)} min {int(low)} max {int(high)}")
+
+    records: list[OtelLogRecord] = logsOut.finishedRecords()
+    print(f"logs: {len(records)} correlated {len([r for r in records if r.traceId == root.traceId and r.spanId in childIds])} severity {records[0].severityText}")
+
+    truncated: OtelSpan = tracer.startSpan("unicode", attributes={"text": "été🦅日本語", "list": ["Zoë🦅東京", "ok"]})
+    listed: list[any] = truncated.getAttribute("list")
+    print(f"truncated by characters: {truncated.getAttribute('text')} [{listed[0]} {listed[1]}]")
+    truncated.end()
+
+    headers: dict[str, str] = {}
+    baggage: OtelBaggage = OtelBaggage()
+    baggage.set("customer", "Zoë 🦅 東京")
+    Otel.inject(headers, root.spanContext(), baggage)
+    back: OtelSpanContext = Otel.extract(headers)
+    print(f"propagated: {back.traceId == root.traceId and back.spanId == root.spanId} baggage {Otel.extractBaggage(headers).get('customer')}")
+
+    print(f"shutdown: {tracing.shutdown().ok()} {metering.shutdown().ok()} {logging.shutdown().ok()}")
+    print("ok")
+}

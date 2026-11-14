@@ -9,7 +9,7 @@
 # expect: full batch wakes worker true export calls >= 2 true
 # expect: periodic flush exported 2
 # expect: overflow queued 5 dropped 3
-# expect: shutdown exports queue true total 5
+# expect: shutdown exports queue true total 10
 # expect: shutdown idempotent true exporter stopped true
 # expect: after shutdown queue refuses 0
 # expect: slow exporter timeout failed 1 error OtelTimeoutError
@@ -22,6 +22,7 @@
 from @lam/otel import OtelTracerProvider, OtelTracer, OtelSpan, OtelSampler, OtelInMemorySpanExporter, OtelSimpleSpanProcessor, OtelBatchSpanProcessor, OtelExportResult, OtelSpanContext
 from lamerrors import Result, Error
 from lamtime import Time
+from lamconcurrency import Atomic
 
 class CountingProcessor {
     func init(self) {
@@ -59,6 +60,33 @@ class SlowExporter {
     }
 
     func shutdown(self) -> Result[bool] {
+        return Result.Ok(true)
+    }
+}
+
+#- Blocks its first export until ``release`` is set (at most 5 s). -#
+class GatedExporter {
+    func init(self) {
+        self.started: Atomic = Atomic(0)
+        self.release: Atomic = Atomic(0)
+        self.exported: Atomic = Atomic(0)
+        self.stopped: Atomic = Atomic(0)
+    }
+
+    func export(self, spans: list[OtelSpan]) -> Result[OtelExportResult] {
+        if self.started.compareAndSwap(0, 1) {
+            waited: int = 0
+            while self.release.get() == 0 and waited < 5000 {
+                Time.sleepMs(5)
+                waited += 5
+            }
+        }
+        _ = self.exported.add(len(spans))
+        return Result.Ok(OtelExportResult(200, "", 1, len(spans)))
+    }
+
+    func shutdown(self) -> Result[bool] {
+        self.stopped.set(1)
         return Result.Ok(true)
     }
 }
@@ -153,16 +181,26 @@ func main() {
     }
     print("periodic flush exported", tickMem.count())
 
-    overMem: OtelInMemorySpanExporter = OtelInMemorySpanExporter()
-    over: OtelBatchSpanProcessor = OtelBatchSpanProcessor(overMem, 5, 60000, 5000, 5000)
+    # A full queue (5 spans) wakes the worker, so the overflow is made
+    # deterministic: the worker takes the first 5 spans and blocks in the
+    # gated export; the next 8 fill the queue (5) and 3 are dropped.
+    gated: GatedExporter = GatedExporter()
+    over: OtelBatchSpanProcessor = OtelBatchSpanProcessor(gated, 5, 60000, 5000, 5000)
     op: OtelTracerProvider = OtelTracerProvider()
     op.addProcessor(over)
+    spans(op.tracer(), 5)
+    waited = 0
+    while gated.started.get() == 0 and waited < 3000 {
+        Time.sleepMs(5)
+        waited += 5
+    }
     spans(op.tracer(), 8)
     print("overflow queued", over.queued(), "dropped", over.dropped())
+    gated.release.set(1)
     closed: Result[bool] = op.shutdown()
-    print("shutdown exports queue", closed.ok(), "total", overMem.count())
+    print("shutdown exports queue", closed.ok(), "total", gated.exported.get())
     again: Result[bool] = over.shutdown()
-    print("shutdown idempotent", again.ok(), "exporter stopped", overMem.stopped)
+    print("shutdown idempotent", again.ok(), "exporter stopped", gated.stopped.get() == 1)
     late: OtelSpan = OtelSpan("late")
     over.onEnd(late)
     print("after shutdown queue refuses", over.queued())
